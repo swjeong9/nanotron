@@ -163,9 +163,9 @@ class FlashRotaryEmbedding(OrigFlashRotaryEmbedding):
             base,
             interleaved,
             scale_base,
-            pos_idx_in_fp32,
             device,
         )
+        self.pos_idx_in_fp32 = pos_idx_in_fp32
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):

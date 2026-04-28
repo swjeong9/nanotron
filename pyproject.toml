@@ -23,7 +23,7 @@ dependencies = [
     "tqdm",
     "datasets",
     "torchtyping",
-    "transformers",
+    "transformers>=4.39,<5",
     "flash-attn>=2.5.0,<2.10.0",
     "psutil",
 ]
@@ -62,9 +62,12 @@ fast-modeling = [
 ]
 
 nanosets = [
-     "transformers",
-     "datatrove[io,processing]@git+https://github.com/huggingface/datatrove",
-     "numba",
+     # Disabled in this fork: datatrove pulls hf-hub>=1.0 + transformers>=5,
+     # which conflicts with the `transformers<5` cap required by
+     # examples/llama/convert_hf_to_nanotron.py (and pinned to 4.39.3 in
+     # examples/llama/requirements.txt). The current research target uses
+     # Alpaca-class data, not nanoset format. Restore from git history if
+     # nanoset datasets are needed later.
 ]
 
 s3 = [
