@@ -10,6 +10,8 @@ Anything specific to the heterogeneous-training research — sweep configs, conv
 |---|---|
 | [`config_tiny_llama_l4_smoke.yaml`](config_tiny_llama_l4_smoke.yaml) | Stage 1 build sanity on a single L4 (g6.xlarge): synthetic ~80M Llama-family model, dummy data, 5 steps, dp=tp=pp=1. Verifies that the fork builds, FlashAttention 2 runs on sm_89, and the training loop completes. |
 | [`config_llama32_1b_l4_resume.yaml`](config_llama32_1b_l4_resume.yaml) | Stage 1 conversion sanity: resumes the converted Llama 3.2 1B checkpoint (`s3://swj-nanotron-model/llama-3.2-1b/nanotron/`) on a single L4 with bf16 optimizer state. Confirms the converted weights load, the loss does not match a fresh random init (so the conversion actually transferred information), and the loop steps cleanly within 24 GiB. |
+| [`nodes.json`](nodes.json) | Active nodes used in the research. Two fields per entry: `private_ip` and `instance_type`. |
+| [`add_node.py`](add_node.py) | `uv run python examples/heterogeneous/add_node.py <private_ip>` — SSH into the given private IP, query its IMDS for the instance type, and append/replace the entry in `nodes.json`. Assumes shared SSH keys within the VPC. |
 
 ## Related artefacts (outside this folder)
 

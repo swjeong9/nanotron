@@ -1,25 +1,8 @@
 {
-  "_comment": "Active nodes for the heterogeneous-PP research. Update entries as instances are launched/stopped. IPs (esp. public) may change on restart; instance_id is the stable handle. See docs/project_background.md §4.5 (dev stages) and §2 (production cluster).",
   "nodes": [
     {
-      "id": "dev-l4-0",
-      "role": "stage1-dev",
-      "instance_id": "i-082ac0228d95b51d3",
-      "instance_type": "g6.xlarge",
-      "region": "us-west-2",
-      "az": "us-west-2a",
-      "private_ipv4": "172.31.31.40",
-      "public_ipv4": "44.243.93.166",
-      "hostname": "ip-172-31-31-40.us-west-2.compute.internal",
-      "gpu": {
-        "model": "NVIDIA L4",
-        "count": 1,
-        "memory_mib": 23034,
-        "compute_capability": "8.9",
-        "nvlink": false
-      },
-      "driver_version": "580.126.09",
-      "notes": "Stage 1 build / conversion / single-GPU sanity. Used to commit the snapshot baseline (uv.lock, .venv with cu126/torch 2.8/flash-attn 2.8.3 cp311)."
+      "private_ip": "172.31.31.40",
+      "instance_type": "g6.xlarge"
     }
   ]
 }
