@@ -253,6 +253,29 @@ D가 본 연구의 핵심 기여, B는 "그냥 GPU 더하면 안 됨"의 anti-ex
 - **End-to-end wall-clock**: 1 epoch 학습 전체 시간 (실제 운영 지표)
 - **Power (Watts)**: GPU 합산 + host 포함 시스템 전력 (별도 로깅)
 - **Energy efficiency (tokens/Joule)**: 1 epoch 누적 기준 핵심 metric
+- **MFU (Model FLOPs Utilization)**: 이기종 환경에서 특히 중요 — GPU 종류별 BF16 peak이 다르므로 단순 throughput으로는 utilization 비교 불가. **per-GPU-type MFU + cluster-wide MFU** 둘 다 보고
+
+### 6.1.1 MFU 산출
+
+```
+achieved_FLOPs/sec  =  (tokens/sec) × (FLOPs per token)
+MFU_per_gpu         =  achieved_FLOPs/sec / (peak_TFLOPs × 10¹²)
+MFU_cluster         =  total_achieved_FLOPs/sec / Σ (peak_TFLOPs_i × 10¹²)
+```
+
+- **FLOPs per token (Llama-class, BF16, causal)**:  `≈ 6N + 12 · L · H² · s / s_total`
+   여기서 `N`=parameters, `L`=layers, `H`=hidden, `s`=seq_len. 본 모델 (Llama 3.1 8B, L=32, H=4096, s=8192) 기준 forward+backward 합 token당 ≈ 6 · 8.03e9 + 12 · 32 · 4096² · 8192 / 8192 ≈ 4.83e10 + 5.37e9 ≈ **5.37e10 FLOPs/token** (attention 항 포함, packing 효과 미반영).
+- **Per-GPU peak BF16 (실측 기준)**:
+
+  | GPU | BF16 dense TFLOPs | NVLink |
+  |---|---:|---|
+  | A100 40GB | **312** | ✓ |
+  | L40S | **91** | ✗ (PCIe Gen4) |
+  | L4 (개발용) | **30** | ✗ |
+  | A10G (개발용) | **70 (FP16)** | ✗ |
+
+- **Cluster-wide MFU 의미**: config B(naive symmetric)는 L40S TP=8이 PCIe all-reduce에 갇혀 achieved_FLOPs가 떨어져 **cluster-wide MFU 저하**. config D(asymmetric layer split)는 stage 처리시간 균등화로 pipeline bubble 최소 → cluster-wide MFU 상승. 이게 본 연구가 가시화하려는 핵심 metric.
+- **Per-GPU-type MFU 의미**: A100 stage MFU는 어차피 NVLink로 높을 것. 진짜 알고 싶은 건 **L40S stage MFU가 config B(TP=8) → C(TP=4) → D(TP=4 + 비대칭 split) 로 가면서 어떻게 변하는가** — heterogeneous에서 underutilized GPU 식별의 직접 지표.
 
 ### 6.2 측정 분리 — 학습 코드 vs 외부 모니터링
 
