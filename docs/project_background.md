@@ -40,20 +40,30 @@
 - nanotron은 코드베이스가 작고 (`ParallelContext`, `PipelineBlock`, `ProcessGroup` 추상이 명시적), hackable함
 - 1F1B, AFAB, ZeRO-1, FP32 grad accumulation 등 필요한 학습 인프라가 갖춰져 있음
 
-**Fork 전략**: `main`이 아닌 **`v0.5` release tag**에서 fork.
-- nanotron main은 2025-05-12 마지막 commit 이후 8개월 정체 상태이며 open issue 112개. unfinished work가 섞여 있을 가능성
-- v0.5는 Hugging Face가 ultrascale-playbook 공식 benchmark를 돌린 검증된 버전
-- 본 연구는 latest feature가 필요한 게 아니라 stable 3D parallelism 위에 비대칭 PP를 올리는 것이 목적
-- main의 critical hotfix가 필요하면 cherry-pick으로 가져옴
+**Fork 전략**: HF nanotron `main`을 그대로 사용 (fork: `swjeong9/nanotron@main`, baseline commit `21b355e`).
+- v0.5(`4799d24`)는 Llama 2 시대 (~2024 중반) 기준이라 `LlamaConfig`에 Llama 3.1+의 `rope_scaling`, 큰 vocab(128k), GQA 변형이 미흡할 가능성. main은 이를 모두 지원함이 확인됨 (§3.2)
+- main에는 v0.5 이후 `llama3_ring_attention.py`(long-context), Qwen, MoE, SmolLM3 (commit `7bc9923`) 등이 추가되어 본 연구 baseline에도 도움
+- 변환 script(`examples/llama/convert_hf_to_nanotron.py`)는 example일 뿐이라 main / v0.5 모두 별도 sanity check가 필요한 건 동일
+- 단점: HF main은 unfinished work가 섞일 수 있음 → 본 작업은 별도 branch에서 진행하고 main은 upstream 추적용으로만
 
-### 3.2 Llama 3.x 지원 확인 필요
+### 3.2 Llama 3.x 지원 — Architecture는 OK, 변환 검증 + S3 저장 전략
 
-nanotron의 `examples/llama/convert_hf_to_nanotron.py`는 Llama 2까지 검증. Llama 3.1 / 3.2 (vocab 128k, RoPE scaling, GQA 변형)는 별도 확인 필요. Phase 1 sanity check 단계에서:
+**Architecture 지원 (확인됨)**: main의 `src/nanotron/config/models_config.py`의 `LlamaConfig` 가 `rope_scaling: Optional[dict]`, `rope_theta: float`, `num_key_value_heads`(GQA), `vocab_size`(default 32000이지만 override 가능)을 모두 보유. `src/nanotron/nn/llama3_ring_attention.py`도 추가됨. 즉 Llama 3.1 8B / 3.2 1B의 architecture 자체는 main에서 지원.
+
+**변환 sanity check 필요** (Phase 1):
+- `examples/llama/convert_hf_to_nanotron.py`는 example이라 직접 수정 가능. 표면 grep 기준 `rope_scaling` 키워드 매핑이 명시적이지 않아 직접 검증 필요.
 - HF → nanotron 변환 무결성 (forward 출력 1e-3 tolerance 내 일치)
-- RoPE scaling 파라미터 매핑 검증
-- vocab 128k tokenizer + tied embedding (Llama 3.2) 처리
+- RoPE scaling 파라미터 매핑 (Llama 3.1)
+- vocab 128k tokenizer + tied embedding (Llama 3.2)
 
-만약 변환이 막히면 Llama 2 13B 또는 Qwen 2.5 14B (이미 nanotron checkpoint 존재 가능성 확인) 로 변경 검토.
+**변환된 checkpoint의 저장 전략**:
+- 변환 비용(8B는 ~15 GB, 1B는 ~2.5 GB)을 매번 재실행하지 않도록 S3에 저장:
+  - **Bucket: `s3://swj-nanotron-model/`**
+  - 경로 규약 (예시): `s3://swj-nanotron-model/llama-3.1-8b/nanotron/`, `s3://swj-nanotron-model/llama-3.2-1b/nanotron/`
+- nanotron의 `s3` extra (`pip install -e ".[s3]"` → `boto3`, `s3fs`, `s5cmd`) 또는 [examples/config_tiny_llama_with_s3_upload.yaml](../examples/config_tiny_llama_with_s3_upload.yaml) 패턴 활용
+- Stage 1 검증에서 한 번만 변환 → S3 업로드. Stage 2 / 본 클러스터에서는 S3에서 직접 download (재변환 없음)
+
+만약 변환이 끝까지 막히면 Llama 2 13B 또는 Qwen 2.5 14B로 변경 검토 (PROJECT_BACKGROUND fallback).
 
 ### 3.3 필요한 수정 (Asymmetric Parallelism 구현)
 
@@ -75,7 +85,8 @@ nanotron의 `examples/llama/convert_hf_to_nanotron.py`는 Llama 2까지 검증. 
 |---|---|
 | FlashAttention 2 | attention 가속. 공식 prebuilt wheel이 sm_80 (A100) + sm_89 (L40S/L4) 모두 포함, `pip install flash-attn --no-build-isolation`로 즉시 설치 |
 | Liger Kernel | RMSNorm, RoPE, SwiGLU, fused linear+CE — 메모리 ~60% 절감, throughput +20% |
-| DCGM | GPU power / utilization 모니터링 |
+| nanotron `s3` extra (`boto3`, `s3fs`, `s5cmd`) | 변환된 checkpoint를 `s3://swj-nanotron-model/` 에 저장/load. `pip install -e ".[s3]"` 로 설치. nanotron 자체에 `examples/config_tiny_llama_with_s3_upload.yaml` 등 S3 통합 예시 존재 |
+| DCGM | GPU power / utilization 모니터링 (Stage 1 검증 결과 [docs/dcgm_test_report.md](dcgm_test_report.md)) |
 | IPMI / PDU | host 전력 측정 (figure에 포함 권장) |
 
 ---
