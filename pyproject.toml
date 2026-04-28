@@ -9,21 +9,33 @@ authors = [
     {name = "Thomas Wolf", email="thomas@huggingface.co"},
 ]
 readme = "README.md"
-requires-python = "~=3.10"
+requires-python = ">=3.10,<3.12"
 classifiers = [
     "Topic :: Software Development"
 ]
 dependencies = [
-    "torch>=1.13.1",
+    "torch>=2.8.0,<2.9.0",
     "pyyaml",
-    "numpy<2",
+    "numpy<3",
     "packaging",
     "safetensors",
     "dacite",
     "tqdm",
     "datasets",
-    "torchtyping"
+    "torchtyping",
+    "transformers",
+    "flash-attn>=2.5.0,<2.10.0",
+    "psutil",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }
 
 [tool.setuptools.packages.find]
 where = ["src"]  # list of folders that contain the packages (["."] by default)
@@ -46,7 +58,7 @@ test = [
 ]
 
 fast-modeling = [
-    "flash-attn>=2.5.0,<2.7.0",
+    "flash-attn>=2.5.0,<2.10.0",
 ]
 
 nanosets = [

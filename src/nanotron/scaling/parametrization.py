@@ -6,7 +6,12 @@ from typing import Dict
 from nanotron.config import Config, ModelArgs
 from nanotron.config.models_config import InitScalingMethod
 from nanotron.nn.layer_norm import LlamaRMSNorm, TritonRMSNorm
-from nanotron.nn.moe import GroupedMLP, Router
+try:
+    from nanotron.nn.moe import GroupedMLP, Router
+
+    _HAS_MOE = True
+except (ImportError, RuntimeError):
+    _HAS_MOE = False
 from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
@@ -42,11 +47,11 @@ class StandardParametrizator(Parametrizator):
             TritonRMSNorm: self._parametrize_layer_norm,
             LlamaRMSNorm: self._parametrize_layer_norm,
             TensorParallelEmbedding: self._parametrize_embedding,
-            # NOTE: MoE's specific initialization
-            GroupedMLP: self._parametrize_grouped_mlp,
-            Router: self._parametrize_router,
             nn.Linear: self._parametrize_column_linear,
         }
+        if _HAS_MOE:
+            self.MODULE_TO_PARAMETRIZE[GroupedMLP] = self._parametrize_grouped_mlp
+            self.MODULE_TO_PARAMETRIZE[Router] = self._parametrize_router
 
         self.std = config.model.init_method.std
         self.num_layers = config.model.model_config.num_hidden_layers
