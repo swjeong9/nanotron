@@ -221,16 +221,23 @@ def build_model(
 
         if pp_layer_partition is not None:
             # Manual partition: only decoder layers are distributed per the user-provided list.
-            # By convention each NanotronModel exposes `model.decoder` as an nn.ModuleList of
-            # decoder PipelineBlocks (Llama, Qwen2, Starcoder2 all follow this).
+            # By convention each NanotronModel (or its inner self.model) exposes `decoder` as
+            # an nn.ModuleList of PipelineBlocks (Llama, Qwen2, Starcoder2 all follow this).
+            # Walk the module tree to find it so wrapper layers like Qwen2ForTraining work.
             assert len(pp_layer_partition) == pp_size, (
                 f"pp_layer_partition length {len(pp_layer_partition)} != pp_size {pp_size}"
             )
-            assert hasattr(model, "decoder"), (
-                f"{type(model).__name__} has no 'decoder' attribute; "
-                f"pp_layer_partition expects an nn.ModuleList of decoder PipelineBlocks."
+            decoder_modulelist = None
+            for sub in model.modules():
+                cand = getattr(sub, "decoder", None)
+                if isinstance(cand, nn.ModuleList) and len(cand) > 0 and isinstance(cand[0], PipelineBlock):
+                    decoder_modulelist = cand
+                    break
+            assert decoder_modulelist is not None, (
+                f"{type(model).__name__} (or its submodules) has no 'decoder' nn.ModuleList of "
+                f"PipelineBlocks; pp_layer_partition is unsupported for this model."
             )
-            decoder_block_ids = {id(b) for b in model.decoder}
+            decoder_block_ids = {id(b) for b in decoder_modulelist}
             decoder_block_idxs = [i for i, b in enumerate(pipeline_blocks) if id(b) in decoder_block_ids]
             assert sum(pp_layer_partition) == len(decoder_block_idxs), (
                 f"sum(pp_layer_partition)={sum(pp_layer_partition)} != "
