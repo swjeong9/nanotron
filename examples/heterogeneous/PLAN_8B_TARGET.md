@@ -35,27 +35,43 @@ PP partition 의 비대칭성 ([n0, n1, n2, n3] with sum=32) 이 본 연구의 �
 
 | 항목 | 값 | 비고 |
 |---|---:|---|
-| sequence length | **8192** | Llama 3.1 8B 의 학습 seq 와 일치 |
-| micro-batch size (mbs) | **8** | 메모리 fit, kernel utilization balance |
-| gradient accumulation (ga) | **32** | 1F1B bubble 8.6% (= 3/35) 로 낮춤 |
-| global batch size (GBS) | **256** | mbs × ga × dp = 8 × 32 × 1 |
-| tokens per step | **2.1M** | GBS × seq = 256 × 8192 |
-| recompute strategy | **full layer** (`parallelism.recompute_layer: true`) | nanotron binary 옵션 (selective 미지원) |
+| sequence length | **2048** | 단축 — production Llama 3.1 8B 의 8192 와 다름. heterogeneous training motivation 검증 만 목표라 단축 OK |
+| micro-batch size (mbs) | **4** | s × b = 8192 의 fit-able product. kernel utilization 적정 |
+| gradient accumulation (ga) | **64** | 1F1B bubble 4.5% (= 3/67), pp_size=4 의 5배 충분 |
+| global batch size (GBS) | **256** | mbs × ga × dp = 4 × 64 × 1 (sequences) |
+| tokens per step | **525K** | GBS × seq = 256 × 2048 |
+| recompute strategy | **selective via flash_attn** (built-in) | nanotron 의 `recompute_layer: true` 는 깨져 있음 (§7-3). flash_attn 의 attention 자동 recompute 로 selective 와 같은 메모리 |
+
+**결정 근거**:
+- Memory: per layer per mb = `s · b · h · 16` (selective + TP=4) = 2048 × 4 × 4096 × 16 = **0.54 GB / GPU**
+  - s × b = 8192 가 critical product. 같은 메모리로 가능한 다른 조합:
+    `(s, b) ∈ {(1024, 8), (2048, 4), (4096, 2), (8192, 1)}`
+- 위 중 mbs=4 가 kernel utilization 과 PP bubble 균형. mbs=1 은 kernel 비효율, mbs=8 은 seq=1024 라 학습 의미 약함.
+- seq=2048 은 production Llama 3.1 8B 의 8192 보다 짧음. context length 측면 손해 있지만 본 motivation 의 목적은 heterogeneous parallelism 검증이라 OK.
+- **production-equivalent setup 으로 가려면**: nanotron 의 recompute path 디버깅 또는 PP/TP 토폴로지 확장 필요 (Open Question).
 
 ## 4. 메모리 모델 (per-GPU)
 
-Full recompute, no SP 가정:
-- per layer per microbatch activation = `2 × s × b × h` bytes (replicated, /t 없음)
+Selective recompute via flash_attn (no SP), seq=2048 mbs=4:
+- per layer per microbatch activation = `s · b · h · (10 + 24/t)` = `s·b·h × 16` bytes per GPU
+- 2048 × 4 × 4096 × 16 = **0.54 GB / GPU**
 - stage 0 (8 layers × 4 in-flight mbs in 1F1B PP=4) 가 가장 빡빡
 
 | 항 | 값 |
 |---|---:|
-| State (BF16 weight + FP32 grad acc + AdamW m/v, per stage 8 dec + emb, ÷ TP=4) | ~8 GB |
-| Activation (stage 0): 8 × 4 × 2 × 8192 × 8 × 4096 / 1e9 | ~17 GB |
+| State (BF16 weight + FP32 grad acc + AdamW m/v, per stage 8 dec + embed, ÷ TP=4) | ~8 GB |
+| Activation (stage 0): 8 × 4 × 0.54 GB | ~17 GB |
+| BF16 grad temp (during backward, 568M × 2) | ~1 GB |
+| Logits intermediate (mbs × seq × vocab × 4 bytes fp32, stage 3 만): 4 × 2048 × 128256 × 4 | ~4 GB (stage 3 만) |
 | Overhead (PyTorch cache + NCCL buffers + intermediate) | ~3 GB |
-| **Per-GPU total** (stage 0, A100 binding) | **~27 GB / 40 GB** |
+| **Per-GPU total** (stage 0, A100 binding) | **~29 GB / 40 GB** |
+| **Per-GPU total** (stage 3 with lm_head, L40S 48GB) | ~30 GB / 48 GB |
 
-정상 fit. stage 1~3 은 in-flight mb 수가 적어 (3, 2, 1) 더 여유.
+정상 fit. stage 1, 2 는 in-flight mb 수 적어 (3, 2) 메모리 더 여유 (~25-27 GB).
+
+**Margin**:
+- A100 stage 0: 40 - 29 = ~11 GB headroom (NCCL/cache 변동 흡수)
+- L40S stage 3: 48 - 30 = ~18 GB headroom
 
 ## 5. 의도적으로 안 쓰는 것
 
