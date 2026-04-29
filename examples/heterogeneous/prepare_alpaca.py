@@ -1,13 +1,18 @@
 """Download tatsu-lab/alpaca, map (instruction, input, output) -> (prompt, completion),
-save as DatasetDict to /tmp/alpaca_sft_local for nanotron SFTDatasetsArgs.
+save as parquet under /opt/dlami/nvme/alpaca_sft_local/ for nanotron SFTDatasetsArgs.
 
     uv run python examples/heterogeneous/prepare_alpaca.py
 
-Run on each node before launching the multi-node training. The output dir is
-local to each node — same content, separate copies (~6.6 M tokens, well under 50 MB).
+We use parquet (not save_to_disk) because nanotron's get_datasets() calls
+load_dataset(local_path) which auto-detects parquet but does NOT understand
+the arrow-based on-disk format produced by save_to_disk.
+
+Run on each node before launching multi-node training (or run once + rsync the
+output dir; ~6.6 M tokens, ~30 MB).
 """
 
-from datasets import DatasetDict, load_dataset
+import os
+from datasets import load_dataset
 
 OUT_DIR = "/opt/dlami/nvme/alpaca_sft_local"
 PROMPT_WITH_INPUT = (
@@ -39,8 +44,10 @@ def to_prompt_completion(example):
 def main() -> None:
     ds = load_dataset("tatsu-lab/alpaca", split="train")
     ds = ds.map(to_prompt_completion, remove_columns=ds.column_names, num_proc=4).shuffle(seed=42)
-    DatasetDict({"train": ds}).save_to_disk(OUT_DIR)
-    print(f"saved {len(ds)} rows to {OUT_DIR}")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUT_DIR, "train.parquet")
+    ds.to_parquet(out_path)
+    print(f"saved {len(ds)} rows to {out_path}")
 
 
 if __name__ == "__main__":
