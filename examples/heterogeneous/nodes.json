@@ -1,12 +1,12 @@
 {
   "nodes": [
     {
-      "private_ip": "172.31.31.40",
-      "instance_type": "g6.xlarge"
+      "private_ip": "172.31.9.136",
+      "instance_type": "g6.12xlarge"
     },
     {
-      "private_ip": "172.31.40.226",
-      "instance_type": "g5.xlarge"
+      "private_ip": "172.31.13.113",
+      "instance_type": "g5.12xlarge"
     }
   ]
 }

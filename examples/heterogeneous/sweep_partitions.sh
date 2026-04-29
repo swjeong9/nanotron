@@ -17,6 +17,8 @@ set -uo pipefail   # ``-e`` 일부러 빼서 한 partition OOM 이라도 이어�
 cd "$(dirname "$0")/../.."
 
 CONFIG="${1:-examples/heterogeneous/configs/llama32_1b/alpaca_pp2.yaml}"
+START_STAGE0="${START_STAGE0:-1}"   # env var, default 1 (전체 sweep)
+END_STAGE0="${END_STAGE0:-}"         # env var, default = NUM_LAYERS - 1
 
 # 강제 sync — sweep 시작 전 한 번. (각 iter 의 benchmark_single 도 자체 sync 하지만
 # 첫 iter 시작 직후 mismatch 가 발견되면 sweep 통째로 무의미해지니 미리 검증)
@@ -25,8 +27,10 @@ NUM_LAYERS=${NUM_LAYERS:-16}
 
 echo "=== Sweep partition: 1..$((NUM_LAYERS - 1)) for $CONFIG ==="
 
+END_STAGE0=${END_STAGE0:-$((NUM_LAYERS - 1))}
 START_TS=$(date +%s)
-for STAGE0 in $(seq 1 $((NUM_LAYERS - 1))); do
+echo "=== Sweep range: stage0 = $START_STAGE0 .. $END_STAGE0 ==="
+for STAGE0 in $(seq "$START_STAGE0" "$END_STAGE0"); do
     STAGE1=$((NUM_LAYERS - STAGE0))
     PARTITION="${STAGE0}-${STAGE1}"
     echo

@@ -9,14 +9,23 @@ setup 으로 이동.
 
 ## 1. 클러스터 구성
 
-| 노드 | 타입 | GPU | 수 | VRAM | 비고 |
-|---|---|---|---:|---:|---|
-| stage 0/1 hosts | p4d.24xlarge × 1 | A100 | 8 | 40 GB | NVLink intra-node, p4 EFA 가능 |
-| stage 2/3 hosts | g6e.12xlarge × 2 | L40S | 8 (4 × 2) | 48 GB | PCIe intra-node, EFA 미확정 |
-| **합계** | | | **16** | | dev 노드 (orchestration) 별도 |
+| 노드 | 타입 | GPU | 수 | VRAM | BF16 dense TC TFLOPS | Mem BW | Intra-node interconnect |
+|---|---|---|---:|---:|---:|---:|---|
+| A100 host | p4d.24xlarge × 1 | A100 SXM 40GB | 8 | 40 GB | **312** | 1,555 GB/s | NVLink |
+| L40S hosts | g6e.12xlarge × 2 | L40S | 8 (4 × 2) | 48 GB | **362** | 864 GB/s | PCIe Gen4 |
+| **합계** | | | **16** | | | | |
 
 - 노드 간 inter-connect: TCP socket (NCCL Socket plugin) 또는 EFA (지원시).
-  현재 사고 시점 기준 EFA 채택 여부 미정 — 일단 TCP 가정.
+  본 plan 작성 시점 기준 EFA 채택 여부 미정 — 일단 TCP 가정.
+
+**Spec 주의 — L40S vs A100 (잘못된 사전 가정 정정)**:
+- L40S 의 **raw BF16 dense TC = 362 TFLOPS, A100 의 312 TFLOPS 보다 +16% 더 높음**
+- 단 A100 의 **memory bandwidth = 1.55 TB/s, L40S 의 864 GB/s 의 1.8×**
+- A100 은 NVLink (intra-node TP NCCL 매우 빠름), L40S 는 PCIe Gen4 only
+- Transformer 학습은 종종 memory-BW + intra-node comm 이 dominant → 실측 throughput 은
+  A100 이 더 빠르거나 비슷할 가능성. **단순 "A100 = fast, L40S = slow" 가정 위험**.
+- Heterogeneous motivation 의 의의: cost-throughput frontier (A100 비싸고 매우 빠른 BW +
+  NVLink, L40S 저렴하고 raw compute 약간 더 빠름) — workload 마다 다른 best partition.
 
 ## 2. Parallelism 결정
 
