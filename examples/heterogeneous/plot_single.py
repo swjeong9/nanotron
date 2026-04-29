@@ -547,14 +547,10 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
         axes[1].text(b.get_x() + b.get_width() / 2, v, f"{v:.1f}%",
                      ha="center", va="bottom", fontsize=9)
     axes[1].set_ylim(0, max(50, max(mfu_vals) * 1.2))
-    # Invisible legend handles to display GPU spec
     legend_handles = [
-        plt.Line2D([0], [0], color="tab:gray", lw=8,
-                   label=f"cluster (peak {cluster_peak_tflops} TFLOPS)"),
-        plt.Line2D([0], [0], color="tab:blue", lw=8,
-                   label=f"L4 (peak {L4_BF16_PEAK_TFLOPS} TFLOPS BF16)"),
-        plt.Line2D([0], [0], color="tab:orange", lw=8,
-                   label=f"A10G (peak {A10G_BF16_PEAK_TFLOPS} TFLOPS BF16)"),
+        plt.Line2D([0], [0], color="tab:gray", lw=8, label="cluster (TFLOPs / TFLOPS)"),
+        plt.Line2D([0], [0], color="tab:blue", lw=8, label="L4 (TFLOPs / TFLOPS)"),
+        plt.Line2D([0], [0], color="tab:orange", lw=8, label="A10G (TFLOPs / TFLOPS)"),
     ]
     axes[1].legend(handles=legend_handles, loc="upper right", fontsize=8)
 
@@ -568,12 +564,15 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
     for b, v in zip(bars3, power_vals):
         axes[2].text(b.get_x() + b.get_width() / 2, v, f"{v:.1f} W",
                      ha="center", va="bottom", fontsize=9)
-    axes[2].axhline(72, ls=":", color="tab:blue", alpha=0.4, linewidth=0.8)
-    axes[2].axhline(150, ls=":", color="tab:orange", alpha=0.4, linewidth=0.8)
-    axes[2].set_ylim(0, 200)
+    # TDP — L4 datacenter spec 72W, A10G (AWS 변종, 일반 A10 의 300W 버전) 300W.
+    L4_TDP_W = 72
+    A10G_TDP_W = 300
+    axes[2].axhline(L4_TDP_W, ls=":", color="tab:blue", alpha=0.4, linewidth=0.8)
+    axes[2].axhline(A10G_TDP_W, ls=":", color="tab:orange", alpha=0.4, linewidth=0.8)
+    axes[2].set_ylim(0, max(A10G_TDP_W, max(power_vals)) * 1.15)
     power_legend_handles = [
-        plt.Line2D([0], [0], color="tab:blue", lw=8, label="L4 (TDP 72W)"),
-        plt.Line2D([0], [0], color="tab:orange", lw=8, label="A10G (TDP 150W)"),
+        plt.Line2D([0], [0], color="tab:blue", lw=8, label=f"L4 (TDP {L4_TDP_W}W)"),
+        plt.Line2D([0], [0], color="tab:orange", lw=8, label=f"A10G (TDP {A10G_TDP_W}W)"),
     ]
     axes[2].legend(handles=power_legend_handles, loc="upper left", fontsize=8)
 

@@ -145,8 +145,8 @@ DCGM 시계열에서는 **활성 / 휴면 구간이 SMCLK 으로 잘 구분**된
 | 검증 항목 | 기대값 (production-like config: mbs=2, ga=64, seq=1024) |
 |---|---|
 | 학습 wall-clock | step1 warmup ~30 s, steady step ~20-25 s |
-| L4 평균 전력 | 30-50 W (idle 12W ~ TDP 72W) |
-| A10G 평균 전력 | 100-145 W (idle 30W ~ TDP 150W) |
+| L4 평균 전력 | 30-60 W (idle 12W ~ TDP 72W) |
+| A10G 평균 전력 | 150-200 W (idle 30W ~ TDP 300W; A10G 는 일반 A10 의 300W 변종) |
 | L4 SMACT | < 0.2 (대부분 P2P 대기 — bottleneck 시) |
 | A10G SMACT | < 0.4 (L4 보다 빠른 GPU 라 wait 비율 더 작음) |
 | NIC TX peak (양 노드) | 100-1000 MB/s (ENA 1.25 GB/s cap 내) |
