@@ -571,9 +571,20 @@ class DistributedTrainer:
                     )
 
                 # Training Logs
-                # Track consumed tokens for all dataset folders in current stage
-                if hasattr(self.current_base_dl, "dataset"):
-                    consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
+                # ---------------------------------------------------------------
+                # [변경] ``get_consumption_stats`` 호출에 hasattr 가드 추가.
+                # ---------------------------------------------------------------
+                # 기존 구현: ``if hasattr(self.current_base_dl, "dataset")`` 만 체크
+                # 후 ``self.current_base_dl.dataset.get_consumption_stats()`` 호출
+                # → ``HuggingFace datasets.Dataset`` 은 ``dataset`` attribute 는
+                # 항상 가지므로 첫 조건은 통과하지만, ``get_consumption_stats``
+                # 는 ``Nanoset`` (nanotron 자체 binary 포맷) 에만 있어
+                # ``AttributeError`` 가 학습 첫 step 의 logging 단계에서 발생.
+                # SFT 경로 (HF datasets) 에서도 안전하게 학습을 진행하도록
+                # ``hasattr`` 로 한 번 더 가드.
+                ds = getattr(self.current_base_dl, "dataset", None)
+                if ds is not None and hasattr(ds, "get_consumption_stats"):
+                    consumption_stats = ds.get_consumption_stats()
                     current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
 
                     # Update consumed tokens for all folders in the consumption stats
@@ -778,7 +789,20 @@ class DistributedTrainer:
                 "tokens_per_sec_per_gpu", tokens_per_sec / self.parallel_context.world_pg.size(), "human_format"
             ),  # , "1.6E"),
             LogItem("global_batch_size", self.config.global_batch_size_in_tokens, "human_format"),  # , "5d"),
-            LogItem("lm_loss", loss_avg.item(), "human_format"),  # , "1.6E"),
+            # ---------------------------------------------------------------
+            # [변경] ``loss_avg`` 가 None 인 PP rank (output 이 아닌 rank) 에서도
+            # log 가 출력되도록 NaN fallback.
+            # ---------------------------------------------------------------
+            # 기존 구현: ``loss_avg.item()`` 무조건 호출. PP=2 의 input rank
+            # (NODE 0) 는 loss 를 계산하지 않으므로 ``loss_avg=None`` 이라
+            # ``AttributeError: 'NoneType' object has no attribute 'item'`` 가
+            # 학습 첫 logging 단계에 발생해 학습이 종료되었음.
+            # 새 구현: None 이면 NaN 으로 표기하고 다른 항목 (lr, tokens/sec 등)
+            # 은 정상 출력. 실제 loss 값은 output rank 의 log 에서 확인.
+            # 추후 개선 — output rank 의 loss 를 input rank 로 broadcast 하여
+            # 양 rank 모두 같은 lm_loss 값을 보이게 하는 방법이 더 깔끔하나,
+            # baseline 검증 시점에서는 fallback 으로 충분.
+            LogItem("lm_loss", loss_avg.item() if loss_avg is not None else float("nan"), "human_format"),  # , "1.6E"),
             LogItem("lr", lr, "human_format"),  # , ".3E"),
             LogItem("model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
@@ -882,9 +906,16 @@ class DistributedTrainer:
         if os.environ.get("DEBUG_DL", "1") == "1":
             assert self.current_base_dl is not None, "current_base_dl should be defined"
 
-            # Log consumption statistics
-            if hasattr(self.current_base_dl, "dataset"):
-                for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
+            # ---------------------------------------------------------------
+            # [변경] 두 번째 ``get_consumption_stats`` 호출에도 동일 가드 추가.
+            # ---------------------------------------------------------------
+            # 기존 구현은 ``DEBUG_DL=1`` 환경변수 (default) 일 때 모든 stage 에서
+            # ``self.current_base_dl.dataset.get_consumption_stats()`` 를 호출 →
+            # HF datasets.Dataset 사용 시 동일한 AttributeError. 위 (line ~575)
+            # 와 같은 패턴으로 hasattr 가드를 적용해 SFT 경로를 안전하게.
+            ds = getattr(self.current_base_dl, "dataset", None)
+            if ds is not None and hasattr(ds, "get_consumption_stats"):
+                for dataset_name, stats in ds.get_consumption_stats().items():
                     basic_log_entries.extend(
                         [
                             LogItem(f"dataloader/consumed_tokens/{dataset_name}", stats["tokens"], "human_format"),

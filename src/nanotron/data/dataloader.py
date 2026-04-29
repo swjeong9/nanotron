@@ -332,13 +332,19 @@ def get_train_dataloader(
         dataloader_num_workers = 0
 
     if use_position_ids:
-        # assert sequence_sep_tokens is not None, "sequence_sep_tokens must be provided if use_position_ids is True"
+        # ---------------------------------------------------------------
+        # [변경] dead kwarg ``sequence_sep_tokens`` 제거.
+        # ---------------------------------------------------------------
+        # 기존 구현: ``DataCollatorForCLMWithPositionIds(...,
+        # sequence_sep_tokens=sequence_sep_tokens)`` 로 호출했으나, collator
+        # dataclass 에는 해당 필드가 없어서 학습 첫 batch 에 ``TypeError:
+        # __init__() got an unexpected keyword argument 'sequence_sep_tokens'``
+        # 가 발생했음. 사용처도 collator 내부에 없어 단순 제거.
         data_collator = DataCollatorForCLMWithPositionIds(
             sequence_length=sequence_length,
             input_pp_rank=input_pp_rank,
             output_pp_rank=output_pp_rank,
             parallel_context=parallel_context,
-            sequence_sep_tokens=sequence_sep_tokens,
         )
     else:
         data_collator = DataCollatorForCLM(
