@@ -1,5 +1,7 @@
 checkpoints:
-  checkpoint_interval: 5
+  # Benchmark 용도라 학습된 weight 가 필요 없음. interval 을 train_steps 보다
+  # 크게 두어 step 중간 save 를 skip. 종료 시점 final save 도 같은 효과.
+  checkpoint_interval: 999999
   checkpoints_path: /opt/dlami/nvme/alpaca_pp2_ckpts
   checkpoints_path_is_shared_file_system: false
   resume_checkpoint_path: /opt/dlami/nvme/llama32_1b_nanotron/model
@@ -13,7 +15,7 @@ data_stages:
       hf_dataset_splits: train
       hf_dataset_config_name: null
       dataset_processing_num_proc_per_process: 4
-      dataset_overwrite_cache: true
+      dataset_overwrite_cache: false
       sft_dataloader: true
       debug_max_samples: null
     num_loading_workers: 2
@@ -102,7 +104,7 @@ tokenizer:
   tokenizer_name_or_path: meta-llama/Llama-3.2-1B
   tokenizer_revision: null
 tokens:
-  batch_accumulation_per_replica: 8
+  batch_accumulation_per_replica: 64
   limit_test_batches: 0
   limit_val_batches: 0
   micro_batch_size: 2

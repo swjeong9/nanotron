@@ -170,3 +170,7 @@ datatrove/
 eval_results/
 tb_logs/
 .nanoset_cache/
+
+# Heterogeneous-PP 연구의 benchmark figures (DCGM 시계열 + ga sweep summary
+# plots). 본 repo 는 코드/config 만 추적하고 그림은 매번 재생성.
+examples/heterogeneous/figures/
