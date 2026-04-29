@@ -761,9 +761,27 @@ class Qwen2Model(nn.Module):
         position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
     ):
         output = self.token_position_embeddings(input_ids=input_ids, position_ids=position_ids)
-        # Compute cu_seqlens
-        cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None
-        if position_ids.numel() > 0:
+        # ---------------------------------------------------------------
+        # [변경] PP > 1 환경에서 cu_seqlens 가 모든 rank 에서 안전하게 흐르도록.
+        # ---------------------------------------------------------------
+        # 기존 구현: 무조건 ``position_ids.numel() > 0`` 검사 → output PP rank
+        # (NODE 1 등) 에서는 position_ids 가 ``TensorPointer`` (실제 텐서가
+        # 아니라 cross-rank placeholder) 이라 ``AttributeError: 'TensorPointer'
+        # object has no attribute 'numel'`` 가 학습 첫 forward 에 발생.
+        #
+        # 또한 cu_seqlens 를 None 으로 두면 다음 PipelineBlock(decoder layer)
+        # 의 forward 에서 ``assert isinstance(tensor, torch.Tensor)`` 가 깨짐
+        # (block.py:85) — None 은 TensorPointer 도 Tensor 도 아니라 PipelineBlock
+        # 이 cross-rank 통신 대상으로 처리할 수 없기 때문.
+        #
+        # 새 구현:
+        #   - input PP rank: 실제 ``cu_seqlens`` 텐서를 계산.
+        #   - 그 외 rank: 동일한 group_rank 를 가리키는 ``TensorPointer`` 를 반환
+        #     → 다음 PipelineBlock 이 input rank 에서 cu_seqlens 를 받아오도록.
+        cu_seqlens: Union[torch.Tensor, TensorPointer, Dict[str, torch.Tensor], None] = None
+        if isinstance(position_ids, TensorPointer):
+            cu_seqlens = TensorPointer(group_rank=position_ids.group_rank)
+        if isinstance(position_ids, torch.Tensor) and position_ids.numel() > 0:
             start_indices = torch.where(position_ids.view(-1) == 0)[0]
             cu_seqlens = torch.cat(
                 [start_indices, torch.tensor([position_ids.numel()], dtype=torch.int32, device=start_indices.device)]

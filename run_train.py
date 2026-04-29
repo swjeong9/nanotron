@@ -122,6 +122,17 @@ def get_dataloader_from_data_stage(
             )["train"]
 
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            # ---------------------------------------------------------------
+            # [변경] ``pad_token`` fallback 추가.
+            # ---------------------------------------------------------------
+            # 기존 구현: ``Nanoset`` 분기 (line ~204) 에서는 같은 fallback 이
+            # 이미 있었으나, HF datasets (PretrainDatasetsArgs / SFTDatasetsArgs)
+            # 분기에는 누락되어 있었음. Llama-3.x tokenizer 는 ``pad_token`` 이
+            # ``None`` 으로 출시되어 있어, sft_processing 의 ``tokenizer(...,
+            # padding=...)`` 호출에서 ``ValueError: Asking to pad but the
+            # tokenizer does not have a padding token`` 발생.
+            # 새 구현: HF dataset 경로에서도 None 이면 EOS 로 fallback (Nanoset
+            # 분기와 동일).
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
             tokenizer.padding_side = "left"
@@ -162,6 +173,15 @@ def get_dataloader_from_data_stage(
                 )
 
             # We load the processed dataset on the ranks requiring it
+            # ---------------------------------------------------------------
+            # [변경] kwarg 이름 ``consumed_train_samples_stage`` → ``consumed_train_samples``.
+            # ---------------------------------------------------------------
+            # 기존 구현이 ``get_train_dataloader(..., consumed_train_samples_stage=
+            # consumed_train_samples_stage)`` 로 호출했으나, dataloader.py 의
+            # 함수 시그니처는 ``consumed_train_samples`` 라 ``TypeError:
+            # got an unexpected keyword argument 'consumed_train_samples_stage'``
+            # 가 학습 시작 시 발생. 의미 자체는 동일하므로 호출 측을 시그니처에
+            # 맞춰 수정.
             dataloader = get_train_dataloader(
                 train_dataset=train_dataset,
                 sequence_length=trainer.sequence_length,
@@ -169,7 +189,7 @@ def get_dataloader_from_data_stage(
                 input_pp_rank=input_pp_rank,
                 output_pp_rank=output_pp_rank,
                 micro_batch_size=trainer.micro_batch_size,
-                consumed_train_samples_stage=consumed_train_samples_stage,
+                consumed_train_samples=consumed_train_samples_stage,
                 dataloader_num_workers=data.num_loading_workers,
                 seed_worker=data.seed,
                 dataloader_drop_last=True,
