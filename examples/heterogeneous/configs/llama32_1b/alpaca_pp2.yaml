@@ -97,7 +97,7 @@ parallelism:
   expert_parallel_size: 1
   pp: 2
   pp_engine: 1f1b
-  pp_layer_partition: [8, 8]
+  pp_layer_partition: [1, 15]
   tp: 1
   tp_linear_async_communication: false
   tp_mode: ALL_REDUCE

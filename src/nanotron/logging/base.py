@@ -280,14 +280,20 @@ def human_format(num: float, billions: bool = False, divide_by_1024: bool = Fals
 
 
 def log_memory(logger: logging.Logger, msg: str = ""):
+    # 모든 rank 에서 출력 — memory 는 per-process, PP=2 의 NODE 1 (rank 1)
+    # 도 별도 측정 필요. log_rank(rank=None) 로 모든 rank 의 stdout 에 찍힘.
+    try:
+        rank = torch_dist.get_rank() if torch_dist.is_initialized() else 0
+    except Exception:
+        rank = 0
     log_rank(
-        f"{msg}\n"
+        f"[rank {rank}] {msg}\n"
         f" Memory usage: {torch.cuda.memory_allocated() / 1024**2:.2f}MiB."
         f" Peak allocated {torch.cuda.max_memory_allocated() / 1024**2:.2f}MiB."
         f" Peak reserved: {torch.cuda.max_memory_reserved() / 1024**2:.2f}MiB",
         logger=logger,
         level=logging.INFO,
-        rank=0,
+        rank=None,
     )
     torch.cuda.reset_peak_memory_stats()
 

@@ -4,6 +4,27 @@
 (``benchmark_single.sh`` 등) 가 **무엇을 어떻게 측정하는지**, 그리고 그
 측정이 **실제로 학습이 도는 동안 동작하는지** 확인할 수 있도록 정리한다.
 
+## 0. ★ 다른 노드 sync 강제 정책 (필수)
+
+**모든 multi-node 실행 entry-point 는 시작 직전에 NODE 1 와의 byte-identical
+sync 를 강제한다**. 이전에 NODE 1 의 ``launch_pp2_node1.sh`` 가 옛날 버전이라
+`config_path` arg 를 무시하고 OLD config 하드코딩 → NODE 0 만 partition
+override 가 적용되어 NODE 1 은 항상 `[8, 8]` 로 학습 → partition mismatch
+환경에서 sweep 결과가 모두 무의미해지는 사고가 있었다.
+
+재발 방지를 위해:
+1. ``benchmark_single.sh``, ``sweep_partitions.sh`` 가 시작 시 자동으로
+   ``sync_to_node1.sh`` 를 호출.
+2. ``sync_to_node1.sh`` 는 ``rsync -aq --delete`` 로 ``examples/heterogeneous/``
+   와 ``src/nanotron/`` 트리를 NODE 1 에 push (NODE 1 의 stale 파일 모두 제거).
+3. 핵심 파일 (``launch_pp2_node{0,1}.sh``, ``logging/base.py``, ``models/base.py``,
+   ``trainer.py``, ``configs/llama32_1b/alpaca_pp2.yaml``) 의 md5sum 양 노드 비교,
+   하나라도 mismatch 면 즉시 abort.
+4. `partition` override 를 위해 sed 으로 config 수정한 후 NODE 1 에 다시 rsync 하고
+   md5 verify 한 번 더.
+
+수동 실험 시에도 multi-node 인 경우 반드시 ``sync_to_node1.sh`` 를 먼저 실행할 것.
+
 ## 1. 측정 대상
 
 | 항목 | 출처 | 단위 / 의미 |

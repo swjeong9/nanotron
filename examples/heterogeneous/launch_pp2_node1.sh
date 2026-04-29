@@ -5,12 +5,12 @@
 # Usage:
 #   bash launch_pp2_node1.sh [config_path]
 # Default config_path:
-#   examples/heterogeneous/configs/llama32_1b/alpaca_pp2_split8-8.yaml
+#   examples/heterogeneous/configs/llama32_1b/alpaca_pp2.yaml
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-CONFIG="${1:-examples/heterogeneous/configs/llama32_1b/alpaca_pp2_split8-8.yaml}"
+CONFIG="${1:-examples/heterogeneous/configs/llama32_1b/alpaca_pp2.yaml}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

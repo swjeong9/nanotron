@@ -99,6 +99,33 @@ def extract_step_timings(log_path: Path) -> List[float]:
 
 _MODEL_FLOPS_RE = re.compile(r"\[ModelFLOPs\]\s+(\w+)=(\d+)")
 _STAGE_FLOPS_RE = re.compile(r"\[StageFLOPs\]\s+stage\s+(\d+):\s+cost=(\d+)\s+\(([\d.]+)%\)\s+modules=\[([^\]]*)\]")
+_MEM_RE = re.compile(
+    r"Memory usage:\s*([\d.]+)MiB\.\s*Peak allocated\s*([\d.]+)MiB\.\s*Peak reserved:\s*([\d.]+)MiB"
+)
+
+
+def extract_memory_peaks(log_path: Path) -> dict:
+    """``Memory usage / Peak allocated / Peak reserved`` 줄을 파싱해 max 추출.
+
+    return: ``{"max_live_MiB": ..., "max_alloc_MiB": ..., "max_reserved_MiB": ...}``
+    """
+    if not log_path.exists():
+        return {}
+    max_live = max_alloc = max_reserved = 0.0
+    for line in log_path.read_text(errors="ignore").splitlines():
+        m = _MEM_RE.search(line)
+        if m:
+            live, alloc, reserved = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            max_live = max(max_live, live)
+            max_alloc = max(max_alloc, alloc)
+            max_reserved = max(max_reserved, reserved)
+    if max_reserved == 0:
+        return {}
+    return {
+        "max_live_MiB": round(max_live, 1),
+        "max_alloc_MiB": round(max_alloc, 1),
+        "max_reserved_MiB": round(max_reserved, 1),
+    }
 
 
 def extract_flops_log(log_path: Path) -> dict:
@@ -844,6 +871,22 @@ def main():
     flops_log = extract_flops_log(run_dir / "train_node0.log")
     if flops_log["per_module"]:
         print(f"loaded module FLOPs: {flops_log['per_module']}")
+
+    # Per-rank memory peaks (nanotron의 log_memory + nvidia-smi 둘 다).
+    memory_peaks = {
+        "node0_l4": extract_memory_peaks(run_dir / "train_node0.log"),
+        "node1_a10g": extract_memory_peaks(run_dir / "train_node1.log"),
+    }
+    # nvidia-smi 의 max memory.used (sustained 값, PyTorch caching allocator 외부 시각).
+    memory_peaks["nvidia_smi_max_MiB_node0"] = meta.get("nvidia_smi_max_used_MiB_node0", 0)
+    memory_peaks["nvidia_smi_max_MiB_node1"] = meta.get("nvidia_smi_max_used_MiB_node1", 0)
+    if memory_peaks["node0_l4"]:
+        print(f"L4   peak reserved (PyTorch): {memory_peaks['node0_l4'].get('max_reserved_MiB', 0):.0f} MiB | "
+              f"nvidia-smi max: {memory_peaks['nvidia_smi_max_MiB_node0']} MiB")
+    if memory_peaks["node1_a10g"]:
+        print(f"A10G peak reserved (PyTorch): {memory_peaks['node1_a10g'].get('max_reserved_MiB', 0):.0f} MiB | "
+              f"nvidia-smi max: {memory_peaks['nvidia_smi_max_MiB_node1']} MiB")
+
     bar_summary = plot_bars(meta, step_boundaries, dcgm0, dcgm1, flops_log, fig_dir / "bars.png")
     print(f"saved {fig_dir / 'bars.png'}")
 
@@ -863,6 +906,7 @@ def main():
         "first_principles": fp,
         "bar_summary": bar_summary,
         "flops_log": flops_log,
+        "memory_peaks": memory_peaks,
     }, indent=2))
     (data_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"saved {data_dir / 'stats.md'} and stats.json + meta.json")
