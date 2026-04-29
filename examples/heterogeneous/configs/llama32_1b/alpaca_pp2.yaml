@@ -37,7 +37,7 @@ lighteval: null
 logging:
   iteration_step_info_interval: 1
   log_level: info
-  log_level_replica: warning
+  log_level_replica: info
 model:
   ddp_bucket_cap_mb: 25
   dtype: bfloat16
@@ -97,7 +97,8 @@ parallelism:
   expert_parallel_size: 1
   pp: 2
   pp_engine: 1f1b
-  pp_layer_partition: [1, 15]
+  pp_layer_partition: [8, 8]
+  recompute_layer: false
   tp: 1
   tp_linear_async_communication: false
   tp_mode: ALL_REDUCE

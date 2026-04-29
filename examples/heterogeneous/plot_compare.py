@@ -135,49 +135,53 @@ def plot_compare(rows: List[Dict], cluster: str, model: str, out_path: Path):
     ax.set_title("Model FLOPs Utilization")
     ax.legend(fontsize=8, loc="upper left")
 
-    # === (3) Power (grouped per-node) ===
+    # === (3) Power (stacked: L4 + A10G + total marker) ===
     ax = axes[1, 0]
-    width = 0.4
     p_l = np.array([r["power_l4"] for r in rows])
     p_a = np.array([r["power_a10g"] for r in rows])
-    ax.bar(xs - width / 2, np.where(fit_mask, p_l, 0), width=width,
+    p_total = p_l + p_a
+    # Stacked bar: L4 아래 + A10G 위
+    ax.bar(xs, np.where(fit_mask, p_l, 0), width=0.7,
            color="tab:blue", label="L4 (TDP 72W)")
-    ax.bar(xs + width / 2, np.where(fit_mask, p_a, 0), width=width,
-           color="tab:orange", label="A10G (TDP 300W)")
-    ax.axhline(72, ls=":", color="tab:blue", alpha=0.4, lw=0.8)
-    ax.axhline(300, ls=":", color="tab:orange", alpha=0.4, lw=0.8)
-    y_max = 350
+    ax.bar(xs, np.where(fit_mask, p_a, 0), bottom=np.where(fit_mask, p_l, 0),
+           width=0.7, color="tab:orange", label="A10G (TDP 300W)")
+    # Total 값 위에 라벨
+    for i, r in enumerate(rows):
+        if fit_mask[i]:
+            ax.text(i, p_total[i], f"{int(p_total[i])}W",
+                    ha="center", va="bottom", fontsize=7, fontweight="bold")
+    y_max = max(400, float(np.max(p_total[fit_mask])) * 1.15) if np.any(fit_mask) else 400
     for i, r in enumerate(rows):
         if r["oom"] or r["completed_steps"] < 2:
             annotate_oom(ax, i, y_max)
     ax.set_xticks(xs)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("avg power [W]")
-    ax.set_title("Average GPU power per node (steady state)")
+    ax.set_title("GPU power per partition (stacked = cluster total)")
     ax.set_ylim(0, y_max)
     ax.legend(fontsize=8, loc="upper right")
 
-    # === (4) Memory (grouped per-node, peak reserved + nvidia-smi) ===
+    # === (4) Memory (stacked: L4 + A10G + cluster total label) ===
     ax = axes[1, 1]
-    # 24 GB cap line (L4 22.06 / A10G 22.06 — 한계는 22 GB 선)
-    ax.axhline(22 * 1024, ls="--", color="red", alpha=0.5, lw=0.8,
-               label="~22 GB usable (24 GB - driver)")
-    width = 0.4
     m_l = np.array([r["mem_l4_nvsmi_MiB"] for r in rows], dtype=float)
     m_a = np.array([r["mem_a10g_nvsmi_MiB"] for r in rows], dtype=float)
-    # 가능한 partition 만 채우기
-    ax.bar(xs - width / 2, np.where(fit_mask, m_l, 0), width=width,
+    m_total = m_l + m_a
+    ax.bar(xs, np.where(fit_mask, m_l, 0), width=0.7,
            color="tab:blue", label="L4 (nvidia-smi max)")
-    ax.bar(xs + width / 2, np.where(fit_mask, m_a, 0), width=width,
-           color="tab:orange", label="A10G (nvidia-smi max)")
-    y_max = 24 * 1024
+    ax.bar(xs, np.where(fit_mask, m_a, 0), bottom=np.where(fit_mask, m_l, 0),
+           width=0.7, color="tab:orange", label="A10G (nvidia-smi max)")
+    for i, r in enumerate(rows):
+        if fit_mask[i]:
+            ax.text(i, m_total[i], f"{int(m_total[i] / 1024)} GiB",
+                    ha="center", va="bottom", fontsize=7, fontweight="bold")
+    y_max = max(48 * 1024, float(np.max(m_total[fit_mask])) * 1.10) if np.any(fit_mask) else 48 * 1024
     for i, r in enumerate(rows):
         if r["oom"] or r["completed_steps"] < 2:
             annotate_oom(ax, i, y_max)
     ax.set_xticks(xs)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("memory used [MiB]")
-    ax.set_title("Peak GPU memory used (nvidia-smi)")
+    ax.set_title("Peak GPU memory per partition (stacked = cluster total)")
     ax.set_ylim(0, y_max)
     ax.legend(fontsize=8, loc="upper left")
 

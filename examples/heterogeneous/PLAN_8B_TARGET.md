@@ -90,18 +90,25 @@ Full recompute, no SP 가정:
    - 결론: PP=2 cross-VPC TCP 환경에서의 partition 의 효과
 3. **★ Recompute 동작 검증** — 본 plan 의 메모리 추정 (~27 GB / GPU on stage 0) 은
    `parallelism.recompute_layer: true` 가 nanotron 에서 정상 작동한다는 가정에 의존.
-   현재까지 한 번도 실측 검증된 적 없음. 다음 항목으로 검증:
 
-   a. 현재 1B 설정에 `parallelism.recompute_layer: true` 만 추가 + [8, 8] 5 step run
-   b. no-recompute (default) vs full-recompute 의 비교:
-      - **메모리**: peak reserved 가 model 대로 줄어드는지 — no-recompute 16 GB →
-        full-recompute 예상 ~9 GB (state 는 동일, activation 만 약 ~7 GB → ~0.7 GB)
-      - **Loss**: 두 run 의 step 1~5 loss 가 동일해야 함 (recompute 는 mathematically
-        equivalent; 다르면 nanotron 버그 — 추가 조사 필요)
-      - **Step time**: ~33% 증가 예상 (forward 두 번 실행 분량). 그 이상 증가는 비효율
-        의심
-   c. 검증 OK 시: 8B target 의 메모리 모델 신뢰 가능. 검증 실패 시: nanotron 의
-      recompute path 디버깅 또는 selective recompute 우회 (PR 작성 등) 필요.
+   **★ 2026-04-29 검증 결과: nanotron 의 `recompute_layer: true` 가 우리
+   setup 에서 작동 안 함**. [8, 8] no-recompute (L4 17.4 GB / A10G 18.1 GB nvsmi)
+   vs recompute=true (L4 22.5 GB / A10G 21.9 GB nvsmi) — **메모리 더 사용**, OOM.
+   forward 의 sharded_cross_entropy 에서 OOM (1F1B 의 mb 들 사이 활성화 누적 + lm_head
+   logits intermediate). 가능 원인: CheckpointFunction 이 1F1B engine 의 mb 큐와
+   상호작용 / `_use_doc_masking: true` (variable seq) interaction / TensorPointer
+   분기 처리.
+
+   → **8B target 의 메모리 모델 신뢰 불가**. 다음 중 하나 필요:
+
+   a. nanotron 의 `Qwen2DecoderLayer.forward` 의 recompute path 디버깅 (메모리
+      profiler 로 어디서 누적되는지 확인). HF upstream PR 가능성.
+   b. nanotron PR — selective recompute 추가 (attention 만 recompute) — 메모리/
+      compute 균형
+   c. 본 motivation 검증을 위해서는 mbs/seq 줄이거나 더 큰 cluster 필요.
+      예: seq=2048 + selective recompute 흉내 (or seq=4096 with mbs=4 — no-recompute
+      에서 fit)
+   d. (대안) Megatron-LM 등 다른 framework 로 8B 학습 — recompute 가 검증된 path
 
 4. **clusters/ 디렉터리 reorg** — 위에서 합의된 구조 (clusters/{l4_a10g, a100_8__l40s_8, ...})
    로 이동. 1B sweep 결과는 이미 `data/l4__a10g_pp2/...` 에 있어 영향 없음.

@@ -69,7 +69,16 @@ TS=$(awk '/^  train_steps:/ { print $2 }' "$CONFIG")
 PARTITION=$(grep '^  pp_layer_partition:' "$CONFIG" \
             | sed -E 's/^.*: *\[//;s/\] *$//;s/ //g;s/,/-/g')
 [ -z "$PARTITION" ] && PARTITION="auto"
-DESCRIPTOR="mbs${MBS}_ga${GA}_split${PARTITION}"
+
+# recompute_layer 켜져 있으면 descriptor 에 ``recomp`` 태그 추가 — no-recompute
+# 결과와 디렉토리 충돌 방지.
+RECOMPUTE_LAYER=$(grep '^  recompute_layer:' "$CONFIG" | awk '{ print $2 }')
+RECOMPUTE_LAYER=${RECOMPUTE_LAYER:-false}
+RECOMPUTE_TAG=""
+if [ "$RECOMPUTE_LAYER" = "true" ]; then
+    RECOMPUTE_TAG="_recomp"
+fi
+DESCRIPTOR="mbs${MBS}_ga${GA}${RECOMPUTE_TAG}_split${PARTITION}"
 
 # Cluster 식별 — nvidia-smi 에서 GPU 종류 받아 ``l4__a10g_pp2`` 식으로.
 gpu_short() {
@@ -261,6 +270,7 @@ cat > "$OUT_DIR/meta.json" <<EOF
   "gbs_seqs": $((MBS * GA)),
   "gbs_tokens_per_step": $((MBS * GA * SEQ)),
   "pp_layer_partition_str": "$PARTITION",
+  "recompute_layer": $RECOMPUTE_LAYER,
   "start_ts_utc": "$START_TS",
   "end_ts_utc": "$END_TS",
   "elapsed_sec": $(awk "BEGIN { print $END_TS - $START_TS }"),
