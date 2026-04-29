@@ -494,70 +494,88 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
     mfu_l4 = achieved_l4_tflops / L4_BF16_PEAK_TFLOPS
     mfu_a10g = achieved_a10g_tflops / A10G_BF16_PEAK_TFLOPS
 
-    # Power: DCGM SMCLK > 1500 (boost) 구간만 평균 (idle 윈도우 제외).
-    n0_active = active_window(dcgm0)
-    n1_active = active_window(dcgm1)
-    avg_power_l4 = mean_safe(r["POWER"] for r in n0_active) if n0_active else 0
-    avg_power_a10g = mean_safe(r["POWER"] for r in n1_active) if n1_active else 0
+    # Power: 다른 metric 과 동일하게 steady-state (step 2..N) wallclock 윈도우만 평균.
+    # SMCLK boost heuristic 은 warmup + cleanup 포함이라 더 넓음 → 일관성 유지 위해 동일 윈도우 사용.
+    steady_starts = [b for b, _, _ in step_boundaries[STEADY_SLICE]]
+    steady_ends = [se for _, _, se in step_boundaries[STEADY_SLICE]]
+    if steady_starts and steady_ends:
+        steady_t0_unix = steady_starts[0]
+        steady_t1_unix = steady_ends[-1]
+    else:
+        steady_t0_unix = step_boundaries[0][0]
+        steady_t1_unix = step_boundaries[-1][2]
 
+    def _dcgm_in_steady(rows, dcgm_start_unix):
+        if not rows or not dcgm_start_unix:
+            return rows
+        return [r for r in rows
+                if steady_t0_unix <= dcgm_start_unix + r["ts"] <= steady_t1_unix]
+
+    dcgm_start_n0 = float(meta.get("dcgm_start_ts_node0") or 0)
+    dcgm_start_n1 = float(meta.get("dcgm_start_ts_node1") or 0)
+    n0_steady = _dcgm_in_steady(dcgm0, dcgm_start_n0)
+    n1_steady = _dcgm_in_steady(dcgm1, dcgm_start_n1)
+    avg_power_l4 = mean_safe(r["POWER"] for r in n0_steady) if n0_steady else 0
+    avg_power_a10g = mean_safe(r["POWER"] for r in n1_steady) if n1_steady else 0
+
+    partition_str = "-".join(str(n) for n in pp_partition)
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
     fig.suptitle(f"Single run summary (step 2..{len(step_boundaries)} steady-state) | "
-                 f"mbs={meta['mbs']} ga={meta['ga']} GBS={meta['gbs_seqs']} | "
-                 f"NODE 0 = L4 / NODE 1 = A10G")
+                 f"mbs={meta['mbs']} ga={meta['ga']} GBS={meta['gbs_seqs']} "
+                 f"split={partition_str} | NODE 0 = L4 / NODE 1 = A10G")
 
     # (1) Throughput
-    bars1 = axes[0].bar(["cluster"], [throughput_tps], color="tab:gray", width=0.5)
+    bars1 = axes[0].bar([f"split {partition_str}"], [throughput_tps],
+                        color="tab:gray", width=0.5)
     axes[0].set_ylabel("throughput [tokens/sec]")
-    axes[0].set_title(f"Throughput\nstep total {steady_total:.2f}s "
-                      f"(fwd/bwd {steady_fwdbwd:.2f}s)")
+    axes[0].set_title("Throughput")
     for b, v in zip(bars1, [throughput_tps]):
         axes[0].text(b.get_x() + b.get_width() / 2, v, f"{v:,.0f}\ntokens/s",
                      ha="center", va="bottom", fontsize=9)
     axes[0].set_ylim(0, throughput_tps * 1.25)
-    axes[0].grid(True, axis="y", alpha=0.3)
 
-    # (2) MFU
+    # (2) MFU. xticks = "cluster" / "L4:0" / "A10G:0" (NUM 은 같은 노드 내 GPU index;
+    # PP=2 single GPU/node 환경에서는 모두 0 — single-node multi-GPU 실험으로
+    # 확장될 때 의미 있어짐).
     mfu_vals = [mfu_cluster * 100, mfu_l4 * 100, mfu_a10g * 100]
-    stage_share_l4 = flops_per_stage[0] / flops_total * 100
-    stage_share_a10g = flops_per_stage[1] / flops_total * 100
-    mfu_labels = [
-        f"cluster\n(peak {cluster_peak_tflops} TFLOPs,\n"
-        f"{cluster_achieved_tflops:.1f} achieved)",
-        f"L4 [stage 0]\n{modules_per_stage[0]}\n"
-        f"({stage_share_l4:.0f}% of FLOPs,\n{achieved_l4_tflops:.1f}/{L4_BF16_PEAK_TFLOPS} TFLOPs)",
-        f"A10G [stage 1]\n{modules_per_stage[1]}\n"
-        f"({stage_share_a10g:.0f}% of FLOPs,\n{achieved_a10g_tflops:.1f}/{A10G_BF16_PEAK_TFLOPS} TFLOPs)",
-    ]
-    bars2 = axes[1].bar(mfu_labels, mfu_vals,
+    mfu_xticks = ["cluster", "L4:0", "A10G:0"]
+    bars2 = axes[1].bar(mfu_xticks, mfu_vals,
                         color=["tab:gray", "tab:blue", "tab:orange"], width=0.6)
     axes[1].set_ylabel("MFU [%]")
-    axes[1].set_title("Model FLOPs Utilization\n"
-                      "(per-stage = stage_FLOPs / step_time / per-GPU peak)")
+    axes[1].set_title("Model FLOPs Utilization (MFU)")
     for b, v in zip(bars2, mfu_vals):
         axes[1].text(b.get_x() + b.get_width() / 2, v, f"{v:.1f}%",
                      ha="center", va="bottom", fontsize=9)
     axes[1].set_ylim(0, max(50, max(mfu_vals) * 1.2))
-    axes[1].axhline(50, ls=":", color="red", alpha=0.4, linewidth=0.8)
-    axes[1].grid(True, axis="y", alpha=0.3)
-    axes[1].tick_params(axis='x', labelsize=8)
+    # Invisible legend handles to display GPU spec
+    legend_handles = [
+        plt.Line2D([0], [0], color="tab:gray", lw=8,
+                   label=f"cluster (peak {cluster_peak_tflops} TFLOPS)"),
+        plt.Line2D([0], [0], color="tab:blue", lw=8,
+                   label=f"L4 (peak {L4_BF16_PEAK_TFLOPS} TFLOPS BF16)"),
+        plt.Line2D([0], [0], color="tab:orange", lw=8,
+                   label=f"A10G (peak {A10G_BF16_PEAK_TFLOPS} TFLOPS BF16)"),
+    ]
+    axes[1].legend(handles=legend_handles, loc="upper right", fontsize=8)
 
-    # (3) Average power per node
+    # (3) Average power per node — same xticks scheme.
     power_vals = [avg_power_l4, avg_power_a10g]
-    power_labels = [f"NODE 0 (L4)\nTDP 72W", f"NODE 1 (A10G)\nTDP 150W"]
-    bars3 = axes[2].bar(power_labels, power_vals,
+    power_xticks = ["L4:0", "A10G:0"]
+    bars3 = axes[2].bar(power_xticks, power_vals,
                         color=["tab:blue", "tab:orange"], width=0.6)
     axes[2].set_ylabel("avg power [W]")
-    axes[2].set_title("Average GPU power\n(DCGM POWER, SMCLK boost 구간)")
+    axes[2].set_title("Average GPU power")
     for b, v in zip(bars3, power_vals):
         axes[2].text(b.get_x() + b.get_width() / 2, v, f"{v:.1f} W",
                      ha="center", va="bottom", fontsize=9)
-    axes[2].axhline(72, ls=":", color="tab:blue", alpha=0.4, linewidth=0.8,
-                    label="L4 TDP (72W)")
-    axes[2].axhline(150, ls=":", color="tab:orange", alpha=0.4, linewidth=0.8,
-                    label="A10G TDP (150W)")
+    axes[2].axhline(72, ls=":", color="tab:blue", alpha=0.4, linewidth=0.8)
+    axes[2].axhline(150, ls=":", color="tab:orange", alpha=0.4, linewidth=0.8)
     axes[2].set_ylim(0, 200)
-    axes[2].legend(loc="upper left", fontsize=8)
-    axes[2].grid(True, axis="y", alpha=0.3)
+    power_legend_handles = [
+        plt.Line2D([0], [0], color="tab:blue", lw=8, label="L4 (TDP 72W)"),
+        plt.Line2D([0], [0], color="tab:orange", lw=8, label="A10G (TDP 150W)"),
+    ]
+    axes[2].legend(handles=power_legend_handles, loc="upper left", fontsize=8)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
