@@ -122,6 +122,8 @@ def get_dataloader_from_data_stage(
             )["train"]
 
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
             tokenizer.padding_side = "left"
             sequence_sep_tokens = [tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token, tokenizer.unk_token]
             # assert bos or eos are present
