@@ -292,6 +292,49 @@ def build_model(
 
     if pp_size > 1:
         model.log_modules(level=logging.INFO, group=parallel_context.world_pg, rank=0)
+
+        # ---------------------------------------------------------------
+        # [추가] per-module / per-stage compute cost 를 명시적으로 log.
+        # ---------------------------------------------------------------
+        # ``get_block_compute_costs()`` 가 default cost-based partition 알고리즘
+        # (line 270-291) 의 입력 — module class → 상대적 FLOPs estimate (per token,
+        # forward 만, attention 무시). 이 raw 값을 log 로 찍어 두면:
+        # 1) 외부 분석 도구 (e.g. plot_single.py) 가 ``[StageFLOPs] ...`` 줄을
+        #    grep 해서 정확한 per-stage MFU 분모 계산 가능 (lm_head 가 어느 stage 에
+        #    들어갔는지를 hardcode 안 해도 됨).
+        # 2) Manual ``pp_layer_partition`` 사용 시 default 와 얼마나 차이 나는지를
+        #    숫자로 비교 가능.
+        try:
+            block_compute_costs = model.get_block_compute_costs()
+        except (AttributeError, NotImplementedError):
+            block_compute_costs = None
+        if block_compute_costs:
+            for cls, cost in block_compute_costs.items():
+                log_rank(
+                    f"[ModelFLOPs] {cls.__name__}={cost}",
+                    logger=logger, level=logging.INFO,
+                    group=parallel_context.world_pg, rank=0,
+                )
+            # Per-stage 합산
+            stage_cost: Dict[int, int] = {}
+            stage_modules: Dict[int, List[str]] = {}
+            for block in pipeline_blocks:
+                cost = block_compute_costs.get(block.module_builder, 0)
+                rk = block.rank
+                stage_cost[rk] = stage_cost.get(rk, 0) + cost
+                stage_modules.setdefault(rk, []).append(block.module_builder.__name__)
+            total = sum(stage_cost.values()) or 1
+            for rk in sorted(stage_cost):
+                pct = stage_cost[rk] / total * 100
+                # module count 요약 (e.g. "LlamaDecoderLayer×8")
+                from collections import Counter
+                ctr = Counter(stage_modules[rk])
+                summary = ", ".join(f"{name}×{n}" for name, n in ctr.items())
+                log_rank(
+                    f"[StageFLOPs] stage {rk}: cost={stage_cost[rk]} ({pct:.1f}%) modules=[{summary}]",
+                    logger=logger, level=logging.INFO,
+                    group=parallel_context.world_pg, rank=0,
+                )
     return model
 
 

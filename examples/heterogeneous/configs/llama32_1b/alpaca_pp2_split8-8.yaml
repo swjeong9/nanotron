@@ -1,11 +1,14 @@
 checkpoints:
   # Benchmark 용도라 학습된 weight 가 필요 없음. interval 을 train_steps 보다
-  # 크게 두어 step 중간 save 를 skip. 종료 시점 final save 도 같은 효과.
+  # 크게 두고 save_final_state 도 false 로 두어 종료 직전 final save 까지
+  # 모두 skip — plot 의 학습 종료 시점 이후 tail 이 checkpoint save 로 오염되는
+  # 것을 막는다.
   checkpoint_interval: 999999
   checkpoints_path: /opt/dlami/nvme/alpaca_pp2_ckpts
   checkpoints_path_is_shared_file_system: false
   resume_checkpoint_path: /opt/dlami/nvme/llama32_1b_nanotron/model
   save_initial_state: false
+  save_final_state: false
   load_lr_scheduler: false
   load_optimizer: false
 data_stages:

@@ -747,6 +747,16 @@ class DistributedTrainer:
 
         self.post_train_step()
 
+        # ---------------------------------------------------------------
+        # [추가] 한 step 이 정말 다 끝난 시점 (optimizer.step + tied sync 포함)
+        # ---------------------------------------------------------------
+        # 기존 ``After train_batch_iter`` 는 forward+backward 끝에서만 찍힘.
+        # 그 후의 sync_tied_weights_gradients (PP=2 tied embedding all-reduce
+        # 약 1 GB) + optimizer.step (1.2B params AdamW + fp32 grad accum) 이
+        # GPU/NIC 에 보이는데 step boundary 로 표시되지 않아 plot 의 "학습
+        # 종료" 시점이 잘못 표시되는 문제. 이 log 로 정확한 step 종료를 capture.
+        log_memory(logger=logger, msg="After training_step")
+
         return outputs, loss_avg, z_loss_avg, tbi_logs
 
     def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:

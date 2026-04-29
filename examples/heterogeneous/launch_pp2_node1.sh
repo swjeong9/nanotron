@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Multi-node PP=2 launch — NODE 1 (172.31.40.226 / g5.xlarge / A10G).
 # rdzv_endpoint points at NODE 0. Run AFTER NODE 0 starts (within ~30s).
+#
+# Usage:
+#   bash launch_pp2_node1.sh [config_path]
+# Default config_path:
+#   examples/heterogeneous/configs/llama32_1b/alpaca_pp2_split8-8.yaml
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+
+CONFIG="${1:-examples/heterogeneous/configs/llama32_1b/alpaca_pp2_split8-8.yaml}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -21,5 +28,5 @@ uv run torchrun \
   --rdzv_endpoint=172.31.31.40:29500 \
   --max_restarts=0 \
   run_train.py \
-  --config-file examples/heterogeneous/config_llama32_1b_alpaca_pp2.yaml \
+  --config-file "$CONFIG" \
   2>&1 | tee /opt/dlami/nvme/pp2_node1.log
