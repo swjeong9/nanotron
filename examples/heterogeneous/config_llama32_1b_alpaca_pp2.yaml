@@ -109,5 +109,5 @@ tokens:
   limit_val_batches: 0
   micro_batch_size: 2
   sequence_length: 1024
-  train_steps: 5
+  train_steps: 10
   val_check_interval: -1

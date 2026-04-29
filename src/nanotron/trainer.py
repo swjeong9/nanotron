@@ -619,8 +619,17 @@ class DistributedTrainer:
             self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator, self.lr_scheduler
         )
 
-        if self.iteration_step < self.initial_iter_step + 5:
-            log_memory(logger=logger, msg="Before train_batch_iter")
+        # ---------------------------------------------------------------
+        # [변경] 첫 5 step 만 log 하던 gate 제거.
+        # ---------------------------------------------------------------
+        # 기존: ``if iteration_step < initial_iter_step + 5`` 로 log_memory 가
+        # 처음 5 step 후엔 silent. benchmark 분석에서 step boundary timestamp
+        # 가 첫 5 개만 추출되는 문제 발생.
+        # 새 구현: 매 step log → benchmark 의 시계열 plot 에 모든 iter 의
+        # before/after timestamp 가 vertical dashed line 으로 표시 가능.
+        # 학습 시간에 미치는 영향: log_memory 는 ``torch.cuda.memory_allocated()``
+        # 와 같은 sync-free 호출만 사용하므로 step time 영향 ~0.
+        log_memory(logger=logger, msg="Before train_batch_iter")
 
         nanotron_timer("train_batch_iter", "cuda").start()
         with torch.profiler.record_function("train_batch_iter"):
@@ -633,8 +642,7 @@ class DistributedTrainer:
             )
         nanotron_timer("train_batch_iter", "cuda").end()
 
-        if self.iteration_step < self.initial_iter_step + 5:
-            log_memory(logger=logger, msg="After train_batch_iter")
+        log_memory(logger=logger, msg="After train_batch_iter")
 
         after_tbi_sanity_checks(self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator)
 
