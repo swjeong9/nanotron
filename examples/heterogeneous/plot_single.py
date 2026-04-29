@@ -548,9 +548,12 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
                      ha="center", va="bottom", fontsize=9)
     axes[1].set_ylim(0, max(50, max(mfu_vals) * 1.2))
     legend_handles = [
-        plt.Line2D([0], [0], color="tab:gray", lw=8, label="cluster (TFLOPs / TFLOPS)"),
-        plt.Line2D([0], [0], color="tab:blue", lw=8, label="L4 (TFLOPs / TFLOPS)"),
-        plt.Line2D([0], [0], color="tab:orange", lw=8, label="A10G (TFLOPs / TFLOPS)"),
+        plt.Line2D([0], [0], color="tab:gray", lw=8,
+                   label=f"cluster ({cluster_achieved_tflops:.1f} / {cluster_peak_tflops} TFLOPS)"),
+        plt.Line2D([0], [0], color="tab:blue", lw=8,
+                   label=f"L4 ({achieved_l4_tflops:.1f} / {L4_BF16_PEAK_TFLOPS} TFLOPS)"),
+        plt.Line2D([0], [0], color="tab:orange", lw=8,
+                   label=f"A10G ({achieved_a10g_tflops:.1f} / {A10G_BF16_PEAK_TFLOPS} TFLOPS)"),
     ]
     axes[1].legend(handles=legend_handles, loc="upper right", fontsize=8)
 
