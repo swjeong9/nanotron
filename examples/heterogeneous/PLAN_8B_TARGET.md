@@ -108,14 +108,28 @@ Selective recompute via flash_attn (no SP), seq=2048 mbs=4:
    `parallelism.recompute_layer: true` 가 nanotron 에서 정상 작동한다는 가정에 의존.
 
    **★ 2026-04-29 검증 결과: nanotron 의 `recompute_layer: true` 가 우리
-   setup 에서 작동 안 함**. [8, 8] no-recompute (L4 17.4 GB / A10G 18.1 GB nvsmi)
-   vs recompute=true (L4 22.5 GB / A10G 21.9 GB nvsmi) — **메모리 더 사용**, OOM.
-   forward 의 sharded_cross_entropy 에서 OOM (1F1B 의 mb 들 사이 활성화 누적 + lm_head
-   logits intermediate). 가능 원인: CheckpointFunction 이 1F1B engine 의 mb 큐와
-   상호작용 / `_use_doc_masking: true` (variable seq) interaction / TensorPointer
-   분기 처리.
+   setup 에서 작동 안 함 (양쪽 변종 모두)**:
 
-   → **8B target 의 메모리 모델 신뢰 불가**. 다음 중 하나 필요:
+   | Config | L4 nvsmi peak | A10G nvsmi peak | 결과 |
+   |---|---:|---:|:---:|
+   | no recompute (baseline) | 17.4 GB | 18.1 GB | ✓ fit |
+   | recompute, **reentrant** (`CheckpointFunction.apply` — nanotron 기본) | 22.5 | 21.9 | ❌ OOM |
+   | recompute, **non-reentrant** (`torch.utils.checkpoint(..., use_reentrant=False)`) | 21.4 | 22.3 | ❌ OOM |
+
+   - **stair-step memory growth 패턴** 관찰 — microbatch 마다 free 안 되고 누적.
+     1F1B 의 steady-state 에서는 pp_size=2 mb 만 in-flight 이어야 메모리 평탄해야
+     하는데, 실제로는 64 mb 진행하며 메모리 단계적 증가 → checkpoint context 가
+     backward 시까지 free 안 됨.
+   - **Reentrant 변종 issue**: forward 를 `torch.no_grad()` 으로 실행, flash_attn
+     의 custom autograd Function 과 interaction 의심. ctx.save_for_backward 가
+     position_ids/cu_seqlens 같은 non-grad tensor 도 저장.
+   - **Non-reentrant 변종 issue**: saved tensor hooks 가 autograd graph 와 함께
+     살아 있음 → nanotron 의 PP engine 이 mb 별로 graph 해제 안 하면 hooks 누적.
+
+   → **두 path 다 PP=2 + flash_attn + 1F1B 환경에서 broken**. 8B target 의 메모리
+   모델 신뢰 불가.
+
+   다음 중 하나 필요:
 
    a. nanotron 의 `Qwen2DecoderLayer.forward` 의 recompute path 디버깅 (메모리
       profiler 로 어디서 누적되는지 확인). HF upstream PR 가능성.

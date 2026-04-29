@@ -1,0 +1,175 @@
+{
+  "meta": {
+    "config_path": "examples/heterogeneous/configs/llama32_1b/alpaca_pp2.yaml",
+    "model": "llama32_1b",
+    "cluster": "l4__a10g_pp2",
+    "gpu_node0": "NVIDIA L4",
+    "gpu_node1": "NVIDIA A10G",
+    "descriptor": "mbs2_ga64_seq1024_split5-11",
+    "config": "production-like (mbs=2 ga=64 seq=1024 train_steps=10 partition=5-11)",
+    "mbs": 2,
+    "ga": 64,
+    "seq_len": 1024,
+    "train_steps": 10,
+    "gbs_seqs": 128,
+    "gbs_tokens_per_step": 131072,
+    "pp_layer_partition_str": "5-11",
+    "start_ts_utc": "1777452099.138684222",
+    "end_ts_utc": "1777452417.815042304",
+    "elapsed_sec": 318.676,
+    "node0_iface": "enp39s0",
+    "node1_iface": "ens5",
+    "dcgm_start_ts_node0": "1777452095.967456299",
+    "dcgm_start_ts_node1": "1777452096.223830599",
+    "iperf_baseline_gbps": 0.0,
+    "oom": false,
+    "completed_steps": 10,
+    "node0_rc": 0,
+    "node1_rc": 0,
+    "nvidia_smi_max_used_MiB_node0": 13436,
+    "nvidia_smi_max_used_MiB_node1": 22324,
+    "pp_layer_partition": [
+      5,
+      11
+    ]
+  },
+  "step_boundaries_unix": [
+    [
+      1777452130.0,
+      1777452183.0,
+      1777452185.0
+    ],
+    [
+      1777452185.0,
+      1777452207.0,
+      1777452207.0
+    ],
+    [
+      1777452209.0,
+      1777452232.0,
+      1777452232.0
+    ],
+    [
+      1777452233.0,
+      1777452256.0,
+      1777452256.0
+    ],
+    [
+      1777452257.0,
+      1777452280.0,
+      1777452280.0
+    ],
+    [
+      1777452281.0,
+      1777452304.0,
+      1777452304.0
+    ],
+    [
+      1777452306.0,
+      1777452328.0,
+      1777452328.0
+    ],
+    [
+      1777452330.0,
+      1777452353.0,
+      1777452353.0
+    ],
+    [
+      1777452354.0,
+      1777452377.0,
+      1777452377.0
+    ],
+    [
+      1777452378.0,
+      1777452401.0,
+      1777452401.0
+    ]
+  ],
+  "fwdbwd_times": [
+    53.0,
+    22.0,
+    23.0,
+    23.0,
+    23.0,
+    23.0,
+    22.0,
+    23.0,
+    23.0,
+    23.0
+  ],
+  "step_total_times": [
+    55.0,
+    22.0,
+    23.0,
+    23.0,
+    23.0,
+    23.0,
+    22.0,
+    23.0,
+    23.0,
+    23.0
+  ],
+  "first_principles": {
+    "tokens_per_step": 131072,
+    "bytes_per_step_GB": 1.074,
+    "measured_step_sec": 22.778,
+    "measured_throughput_tokens_per_sec": 5754.4,
+    "measured_avg_nic_bytes_per_step_MBps": 47.1,
+    "theoretical_compute_per_stage_sec_l4": 16.2,
+    "theoretical_compute_per_stage_sec_a10g": 6.94,
+    "theoretical_comm_at_ena_burst_sec": 0.86,
+    "theoretical_comm_at_ena_baseline_sec": 6.87,
+    "implied_idle_sec": 5.72
+  },
+  "bar_summary": {
+    "throughput_tokens_per_sec": 5754.380487804878,
+    "pp_partition": [
+      5,
+      11
+    ],
+    "flops_per_stage_TF_per_step": [
+      263.88279066624,
+      787.112886534144
+    ],
+    "achieved_tflops_cluster": 46.14127363318759,
+    "achieved_tflops_l4": 11.585098126810538,
+    "achieved_tflops_a10g": 34.55617550637705,
+    "mfu_cluster_pct": 18.756615298043737,
+    "mfu_l4_pct": 9.57446126182689,
+    "mfu_a10g_pct": 27.644940405101643,
+    "avg_power_l4_w": 47.976925925925926,
+    "avg_power_a10g_w": 210.197625,
+    "steady_step_sec": 22.77777777777778,
+    "steady_fwdbwd_sec": 22.77777777777778
+  },
+  "flops_log": {
+    "per_module": {
+      "Qwen2DecoderLayer": 67108864,
+      "TensorParallelColumnLinear": 262668288
+    },
+    "per_stage": [
+      {
+        "rank": 0,
+        "cost": 335544320,
+        "pct": 25.1,
+        "modules": "Embedding\u00d71, Qwen2DecoderLayer\u00d75"
+      },
+      {
+        "rank": 1,
+        "cost": 1000865792,
+        "pct": 74.9,
+        "modules": "Qwen2DecoderLayer\u00d711, TritonRMSNorm\u00d71, TensorParallelColumnLinear\u00d71, Loss\u00d71"
+      }
+    ]
+  },
+  "memory_peaks": {
+    "node0_l4": {
+      "max_live_MiB": 9826.3,
+      "max_alloc_MiB": 12473.4,
+      "max_reserved_MiB": 12624.0
+    },
+    "node1_a10g": {},
+    "nvidia_smi_max_MiB_node0": 13436,
+    "nvidia_smi_max_MiB_node1": 22324
+  }
+}

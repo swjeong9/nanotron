@@ -1,0 +1,175 @@
+{
+  "meta": {
+    "config_path": "examples/heterogeneous/configs/llama32_1b/alpaca_pp2.yaml",
+    "model": "llama32_1b",
+    "cluster": "l4__a10g_pp2",
+    "gpu_node0": "NVIDIA L4",
+    "gpu_node1": "NVIDIA A10G",
+    "descriptor": "mbs2_ga64_seq1024_split6-10",
+    "config": "production-like (mbs=2 ga=64 seq=1024 train_steps=10 partition=6-10)",
+    "mbs": 2,
+    "ga": 64,
+    "seq_len": 1024,
+    "train_steps": 10,
+    "gbs_seqs": 128,
+    "gbs_tokens_per_step": 131072,
+    "pp_layer_partition_str": "6-10",
+    "start_ts_utc": "1777452429.379437197",
+    "end_ts_utc": "1777452745.122749495",
+    "elapsed_sec": 315.743,
+    "node0_iface": "enp39s0",
+    "node1_iface": "ens5",
+    "dcgm_start_ts_node0": "1777452426.198557733",
+    "dcgm_start_ts_node1": "1777452426.457748424",
+    "iperf_baseline_gbps": 0.0,
+    "oom": false,
+    "completed_steps": 10,
+    "node0_rc": 0,
+    "node1_rc": 0,
+    "nvidia_smi_max_used_MiB_node0": 14892,
+    "nvidia_smi_max_used_MiB_node1": 21068,
+    "pp_layer_partition": [
+      6,
+      10
+    ]
+  },
+  "step_boundaries_unix": [
+    [
+      1777452461.0,
+      1777452513.0,
+      1777452514.0
+    ],
+    [
+      1777452514.0,
+      1777452537.0,
+      1777452537.0
+    ],
+    [
+      1777452538.0,
+      1777452560.0,
+      1777452560.0
+    ],
+    [
+      1777452562.0,
+      1777452585.0,
+      1777452585.0
+    ],
+    [
+      1777452586.0,
+      1777452609.0,
+      1777452609.0
+    ],
+    [
+      1777452610.0,
+      1777452632.0,
+      1777452632.0
+    ],
+    [
+      1777452634.0,
+      1777452656.0,
+      1777452656.0
+    ],
+    [
+      1777452658.0,
+      1777452680.0,
+      1777452680.0
+    ],
+    [
+      1777452682.0,
+      1777452704.0,
+      1777452704.0
+    ],
+    [
+      1777452706.0,
+      1777452729.0,
+      1777452729.0
+    ]
+  ],
+  "fwdbwd_times": [
+    52.0,
+    23.0,
+    22.0,
+    23.0,
+    23.0,
+    22.0,
+    22.0,
+    22.0,
+    22.0,
+    23.0
+  ],
+  "step_total_times": [
+    53.0,
+    23.0,
+    22.0,
+    23.0,
+    23.0,
+    22.0,
+    22.0,
+    22.0,
+    22.0,
+    23.0
+  ],
+  "first_principles": {
+    "tokens_per_step": 131072,
+    "bytes_per_step_GB": 1.074,
+    "measured_step_sec": 22.444,
+    "measured_throughput_tokens_per_sec": 5839.8,
+    "measured_avg_nic_bytes_per_step_MBps": 47.8,
+    "theoretical_compute_per_stage_sec_l4": 16.2,
+    "theoretical_compute_per_stage_sec_a10g": 6.94,
+    "theoretical_comm_at_ena_burst_sec": 0.86,
+    "theoretical_comm_at_ena_baseline_sec": 6.87,
+    "implied_idle_sec": 5.38
+  },
+  "bar_summary": {
+    "throughput_tokens_per_sec": 5839.8415841584165,
+    "pp_partition": [
+      6,
+      10
+    ],
+    "flops_per_stage_TF_per_step": [
+      316.659348799488,
+      734.336328400896
+    ],
+    "achieved_tflops_cluster": 46.826540073284434,
+    "achieved_tflops_l4": 14.108584847501941,
+    "achieved_tflops_a10g": 32.7179552257825,
+    "mfu_cluster_pct": 19.035178891579037,
+    "mfu_l4_pct": 11.659987477274331,
+    "mfu_a10g_pct": 26.174364180625997,
+    "avg_power_l4_w": 50.71883720930233,
+    "avg_power_a10g_w": 203.21487906976745,
+    "steady_step_sec": 22.444444444444443,
+    "steady_fwdbwd_sec": 22.444444444444443
+  },
+  "flops_log": {
+    "per_module": {
+      "Qwen2DecoderLayer": 67108864,
+      "TensorParallelColumnLinear": 262668288
+    },
+    "per_stage": [
+      {
+        "rank": 0,
+        "cost": 402653184,
+        "pct": 30.1,
+        "modules": "Embedding\u00d71, Qwen2DecoderLayer\u00d76"
+      },
+      {
+        "rank": 1,
+        "cost": 933756928,
+        "pct": 69.9,
+        "modules": "Qwen2DecoderLayer\u00d710, TritonRMSNorm\u00d71, TensorParallelColumnLinear\u00d71, Loss\u00d71"
+      }
+    ]
+  },
+  "memory_peaks": {
+    "node0_l4": {
+      "max_live_MiB": 10886.5,
+      "max_alloc_MiB": 13910.6,
+      "max_reserved_MiB": 14080.0
+    },
+    "node1_a10g": {},
+    "nvidia_smi_max_MiB_node0": 14892,
+    "nvidia_smi_max_MiB_node1": 21068
+  }
+}

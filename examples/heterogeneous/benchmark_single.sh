@@ -78,7 +78,7 @@ RECOMPUTE_TAG=""
 if [ "$RECOMPUTE_LAYER" = "true" ]; then
     RECOMPUTE_TAG="_recomp"
 fi
-DESCRIPTOR="mbs${MBS}_ga${GA}${RECOMPUTE_TAG}_split${PARTITION}"
+DESCRIPTOR="mbs${MBS}_ga${GA}_seq${SEQ}${RECOMPUTE_TAG}_split${PARTITION}"
 
 # Cluster 식별 — nvidia-smi 에서 GPU 종류 받아 ``l4__a10g_pp2`` 식으로.
 gpu_short() {

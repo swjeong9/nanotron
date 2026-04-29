@@ -31,8 +31,13 @@ except Exception:
     pass
 
 
-def load_partition_data(cluster: str, model: str, data_root: Path) -> List[Dict]:
-    """Returns sorted list of {partition_str, partition_tuple, ...metrics}."""
+def load_partition_data(cluster: str, model: str, data_root: Path,
+                        seq_filter: Optional[int] = None,
+                        recompute_filter: Optional[bool] = None) -> List[Dict]:
+    """Returns sorted list of {partition_str, partition_tuple, ...metrics}.
+
+    seq_filter / recompute_filter: 일치 안 하면 skip. None 이면 전부.
+    """
     base = data_root / cluster / model
     if not base.exists():
         return []
@@ -44,6 +49,10 @@ def load_partition_data(cluster: str, model: str, data_root: Path) -> List[Dict]
         ps = meta.get("pp_layer_partition_str") or ""
         if not ps:
             continue
+        if seq_filter is not None and meta.get("seq_len") != seq_filter:
+            continue
+        if recompute_filter is not None and bool(meta.get("recompute_layer", False)) != recompute_filter:
+            continue
         # ``11-5`` → (11, 5)
         partition_tuple = tuple(int(x) for x in ps.split("-"))
         bs = s.get("bar_summary") or {}
@@ -53,6 +62,8 @@ def load_partition_data(cluster: str, model: str, data_root: Path) -> List[Dict]
         rows.append({
             "partition_str": ps,
             "partition_tuple": partition_tuple,
+            "seq_len": meta.get("seq_len"),
+            "recompute_layer": bool(meta.get("recompute_layer", False)),
             "oom": bool(meta.get("oom", False)) or s.get("failed", False),
             "completed_steps": int(meta.get("completed_steps", 0)),
             "throughput": bs.get("throughput_tokens_per_sec", 0),
@@ -79,7 +90,8 @@ def annotate_oom(ax, x: int, y_max: float):
             color="red", fontsize=9, fontweight="bold", rotation=90)
 
 
-def plot_compare(rows: List[Dict], cluster: str, model: str, out_path: Path):
+def plot_compare(rows: List[Dict], cluster: str, model: str,
+                 out_path: Path, subtitle: str = ""):
     if not rows:
         print("[plot_compare] no data")
         return
@@ -90,8 +102,11 @@ def plot_compare(rows: List[Dict], cluster: str, model: str, out_path: Path):
     fit_mask = np.array([not r["oom"] and r["completed_steps"] >= 2 for r in rows])
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    fig.suptitle(f"Partition sweep: {cluster} / {model} | "
-                 f"each x-tick = pp_layer_partition (sum=16)", fontsize=11)
+    title = f"Partition sweep: {cluster} / {model}"
+    if subtitle:
+        title += f" | {subtitle}"
+    title += f" | each x-tick = pp_layer_partition (sum={sum(rows[0]['partition_tuple'])})"
+    fig.suptitle(title, fontsize=11)
 
     # === (1) Throughput + step time ===
     ax = axes[0, 0]
@@ -195,20 +210,41 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cluster", default="l4__a10g_pp2")
     ap.add_argument("--model", default="llama32_1b")
+    ap.add_argument("--seq", type=int, default=None,
+                    help="filter by sequence_length (e.g. 1024). None = all configs.")
+    ap.add_argument("--recompute", choices=["true", "false", "any"], default="any")
     ap.add_argument("--data-root",
                     default="/home/ubuntu/nanotron/examples/heterogeneous/data")
     ap.add_argument("--out",
                     default="/home/ubuntu/nanotron/examples/heterogeneous/figures")
     args = ap.parse_args()
 
-    rows = load_partition_data(args.cluster, args.model, Path(args.data_root))
+    recompute_filter = None if args.recompute == "any" else (args.recompute == "true")
+    rows = load_partition_data(args.cluster, args.model, Path(args.data_root),
+                               seq_filter=args.seq, recompute_filter=recompute_filter)
     if not rows:
-        raise SystemExit(f"No data in {args.data_root}/{args.cluster}/{args.model}")
+        raise SystemExit(f"No data after filter (seq={args.seq}, recompute={args.recompute})")
     print(f"loaded {len(rows)} partitions: " + ", ".join(r["partition_str"] for r in rows))
 
-    out_dir = Path(args.out) / args.cluster / args.model / "comparison"
+    # 출력 dir 에 filter 정보 포함
+    sub_parts = []
+    if args.seq is not None:
+        sub_parts.append(f"seq{args.seq}")
+    if args.recompute != "any":
+        sub_parts.append(f"recomp_{args.recompute}")
+    sub = "_".join(sub_parts) if sub_parts else "all"
+    out_dir = Path(args.out) / args.cluster / args.model / f"comparison_{sub}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    plot_compare(rows, args.cluster, args.model, out_dir / "partition_compare.png")
+
+    subtitle_parts = []
+    if args.seq is not None:
+        subtitle_parts.append(f"seq={args.seq}")
+    if args.recompute != "any":
+        subtitle_parts.append(f"recompute={args.recompute}")
+    subtitle = ", ".join(subtitle_parts)
+
+    plot_compare(rows, args.cluster, args.model,
+                 out_dir / "partition_compare.png", subtitle=subtitle)
 
 
 if __name__ == "__main__":
