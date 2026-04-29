@@ -757,33 +757,38 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--run-dir",
-        help="Benchmark output dir (defaults to last single_run dir under "
-             "/opt/dlami/nvme/runs/<model>/<descriptor>/).",
+        help="Raw benchmark output dir (defaults to most recent under "
+             "/opt/dlami/nvme/runs/<cluster>/<model>/<descriptor>/).",
     )
     ap.add_argument("--awk", default="/home/ubuntu/nanotron/examples/heterogeneous/dcgm_text_to_jsonl.awk")
-    ap.add_argument(
-        "--figures-dir",
-        help="Figures output dir. Auto-derived from meta if omitted.",
-    )
+    ap.add_argument("--figures-dir", help="PNG out (auto if omitted).")
+    ap.add_argument("--data-dir", help="stats/json out (auto if omitted).")
     args = ap.parse_args()
 
-    # run-dir resolution: explicit arg > /opt/dlami/nvme/runs/*/* (most recent)
+    # run-dir resolution: explicit arg > /opt/dlami/nvme/runs/*/*/* (most recent)
     if args.run_dir:
         run_dir = Path(args.run_dir)
     else:
-        candidates = sorted(Path("/opt/dlami/nvme/runs").glob("*/*"),
-                            key=lambda p: p.stat().st_mtime, reverse=True) \
-                     if Path("/opt/dlami/nvme/runs").exists() else []
+        candidates = []
+        if Path("/opt/dlami/nvme/runs").exists():
+            for p in Path("/opt/dlami/nvme/runs").rglob("meta.json"):
+                candidates.append(p.parent)
+            candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
         if not candidates:
-            raise SystemExit("No --run-dir given and no /opt/dlami/nvme/runs/*/* found")
+            raise SystemExit("No --run-dir given and no /opt/dlami/nvme/runs/**/meta.json found")
         run_dir = candidates[0]
         print(f"[plot] auto-detected run_dir = {run_dir}")
 
     awk = Path(args.awk)
     meta = json.loads((run_dir / "meta.json").read_text())
 
-    # PP partition 정보 — meta 에 이미 있으면 그대로, 없으면 config 에서 읽어 합침.
-    if "pp_layer_partition" not in meta and "config_path" in meta:
+    # PP partition 정보 — 우선순위: (1) meta 의 pp_layer_partition_str (benchmark
+    # override 값, 항상 정확), (2) meta 의 pp_layer_partition list, (3) config 파일.
+    # config 파일은 sweep 종료 후 baseline 으로 restore 되어 있어 잘못된 값을 줄 수
+    # 있으니 마지막 수단으로만.
+    if "pp_layer_partition_str" in meta:
+        meta["pp_layer_partition"] = [int(x) for x in meta["pp_layer_partition_str"].split("-") if x]
+    elif "pp_layer_partition" not in meta and "config_path" in meta:
         cfg = Path(f"/home/ubuntu/nanotron/{meta['config_path']}")
         if cfg.exists():
             for line in cfg.read_text().splitlines():
@@ -793,15 +798,39 @@ def main():
                     meta["pp_layer_partition"] = [int(x.strip()) for x in rhs.split(",") if x.strip()]
                     break
 
-    # figures-dir resolution: explicit arg > derived from meta (model/descriptor)
-    if args.figures_dir:
-        fig_dir = Path(args.figures_dir)
-    else:
-        model = meta.get("model", "unknown_model")
-        descriptor = meta.get("descriptor", run_dir.name)
-        fig_dir = Path("/home/ubuntu/nanotron/examples/heterogeneous/figures") / model / descriptor
-        print(f"[plot] auto-derived figures_dir = {fig_dir}")
+    cluster = meta.get("cluster", "unknown_cluster")
+    model = meta.get("model", "unknown_model")
+    descriptor = meta.get("descriptor", run_dir.name)
+
+    EX_HET = Path("/home/ubuntu/nanotron/examples/heterogeneous")
+    fig_dir = Path(args.figures_dir) if args.figures_dir \
+        else EX_HET / "figures" / cluster / model / descriptor
+    data_dir = Path(args.data_dir) if args.data_dir \
+        else EX_HET / "data" / cluster / model / descriptor
     fig_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[plot] figures → {fig_dir}")
+    print(f"[plot] data    → {data_dir}")
+
+    # OOM / failed run: skip plot 생성, OOM 표기만 stats.md 에 남기고 종료.
+    oom = bool(meta.get("oom", False))
+    completed_steps = int(meta.get("completed_steps", 0))
+    if oom or completed_steps < 2:
+        reason = "OOM" if oom else f"insufficient steps completed ({completed_steps})"
+        (data_dir / "stats.md").write_text(
+            f"# {descriptor} — FAILED ({reason})\n\n"
+            f"- cluster: {cluster}\n- model: {model}\n- descriptor: {descriptor}\n"
+            f"- oom: {oom}\n- completed_steps: {completed_steps}\n"
+        )
+        (data_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (data_dir / "stats.json").write_text(json.dumps({
+            "meta": meta,
+            "oom": oom,
+            "completed_steps": completed_steps,
+            "failed": True,
+        }, indent=2))
+        print(f"[plot] {descriptor}: skipped plotting ({reason})")
+        return
 
     dcgm0 = dcgm_jsonl(run_dir / "dcgm_node0.txt", awk)
     dcgm1 = dcgm_jsonl(run_dir / "dcgm_node1.txt", awk)
@@ -825,8 +854,8 @@ def main():
 
     nic0_rate = nic_to_rate(nic0)
     nic1_rate = nic_to_rate(nic1)
-    write_stats(meta, dcgm0, dcgm1, nic0_rate, nic1_rate, step_boundaries, fp, fig_dir / "stats.md")
-    (fig_dir / "stats.json").write_text(json.dumps({
+    write_stats(meta, dcgm0, dcgm1, nic0_rate, nic1_rate, step_boundaries, fp, data_dir / "stats.md")
+    (data_dir / "stats.json").write_text(json.dumps({
         "meta": meta,
         "step_boundaries_unix": step_boundaries,
         "fwdbwd_times": [fb - b for b, fb, _ in step_boundaries],
@@ -835,7 +864,8 @@ def main():
         "bar_summary": bar_summary,
         "flops_log": flops_log,
     }, indent=2))
-    print(f"saved {fig_dir / 'stats.md'} and stats.json")
+    (data_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"saved {data_dir / 'stats.md'} and stats.json + meta.json")
 
 
 if __name__ == "__main__":
