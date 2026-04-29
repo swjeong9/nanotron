@@ -199,6 +199,18 @@ class DataCollatorForCLMWithPositionIds:
             f"Samples should be of length {self.sequence_length + 1} (seq_len+1), " f"but got {expanded_input_length}"
         )
 
+        # ---------------------------------------------------------------
+        # [변경 #1] Context-parallel rank/size 를 위로 끌어올림.
+        # ---------------------------------------------------------------
+        # 기존 구현: ``cp_rank`` 가 ``if current_pp_rank == self.input_pp_rank``
+        # 분기 안에서만 정의되었음. 그러나 같은 함수 아래쪽 ``output_pp_rank``
+        # 분기 (line ~256 부근) 의 label_ids/label_mask slicing 도
+        # ``cp_rank * self.sequence_length // cp_size`` 를 사용 → output rank
+        # (PP=2 의 NODE 1) 입장에서는 input 분기를 안 타므로 ``UnboundLocalError:
+        # cannot access local variable 'cp_rank'`` 가 학습 첫 microbatch 에
+        # 발생했음. 이를 분기 위로 끌어올려 양쪽 분기에서 동일하게 참조.
+        cp_rank, cp_size = dist.get_rank(self.parallel_context.cp_pg), self.parallel_context.context_parallel_size
+
         # Process inputs
         if current_pp_rank == self.input_pp_rank:
             result["input_ids"] = input_ids[:, :-1]
@@ -213,7 +225,6 @@ class DataCollatorForCLMWithPositionIds:
                 result["positions"] = np.arange(self.sequence_length)[None, :].repeat(batch_size, axis=0)
 
             # Context Parallelism: Each CP rank gets a slice of the input_ids and position_ids
-            cp_rank, cp_size = dist.get_rank(self.parallel_context.cp_pg), self.parallel_context.context_parallel_size
             local_slice = slice(
                 cp_rank * self.sequence_length // cp_size, (cp_rank + 1) * self.sequence_length // cp_size
             )
@@ -226,8 +237,29 @@ class DataCollatorForCLMWithPositionIds:
         if current_pp_rank == self.output_pp_rank:
             result["label_ids"] = input_ids[:, 1:]
 
-            # Create label mask based on position_ids
-            if "positions" in examples[0] and self.use_doc_masking:
+            # ---------------------------------------------------------------
+            # [변경 #2] label_mask 우선순위 재정의 — SFT label_mask 를 존중.
+            # ---------------------------------------------------------------
+            # 기존 구현: ``use_doc_masking=True`` + ``positions`` 가 있으면 무조건
+            # ``positions == 0`` 인 boundary 토큰 1개만 마스킹하고 나머지를 모두
+            # loss 에 포함시켰음. SFT 경로에서 ``prepare_sft_dataset`` 가 만든
+            # ``label_mask`` (prompt=False, completion=True) 가 examples 에
+            # 들어와도 ``positions`` 가 함께 오면 collator 가 그 label_mask 를
+            # 무시하고 자동 생성된 마스크로 덮어써서 prompt 토큰이 loss 에
+            # 잘못 포함됐음.
+            #
+            # 새 구현: 우선순위를 다음 순서로 명시.
+            #   1) examples 가 명시적으로 ``label_mask`` 를 제공 → 그대로 사용
+            #      (단, label_ids 가 input_ids[:, 1:] 로 shift 되었으므로
+            #       label_mask 도 동일하게 shift)
+            #   2) ``positions`` 가 있고 doc-masking 활성 → boundary 토큰만 자동 마스킹
+            #      (사전학습/CLM 에서 packed input 의 sample 경계 처리)
+            #   3) 둘 다 없으면 모든 라벨 학습 (기본 CLM)
+            if "label_mask" in examples[0]:
+                lm = np.vstack([examples[i]["label_mask"] for i in range(len(examples))]).astype(np.bool_)
+                # label_ids 가 input_ids[:, 1:] 라 label_mask 도 [:, 1:] 로 정렬.
+                result["label_mask"] = lm[:, 1:]
+            elif "positions" in examples[0] and self.use_doc_masking:
                 # Get position_ids for the labels (shifted right by 1 to align with label_ids)
                 position_ids = np.vstack([examples[i]["positions"] for i in range(len(examples))])
                 position_ids = position_ids[:, 1:]  # Shift right to align with labels
