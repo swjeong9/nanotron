@@ -21,7 +21,9 @@ class ParallelContext:
     ):
         """Initialize parallel context."""
         world_size = int(os.environ["WORLD_SIZE"])
-        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "8")) if world_size > 8 else world_size
+        # torchrun always sets LOCAL_WORLD_SIZE (= --nproc_per_node). Fall back to world_size only
+        # for direct (non-torchrun) launches where the whole world is on one host.
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
 
         assert (
             tensor_parallel_size * pipeline_parallel_size * context_parallel_size * data_parallel_size
