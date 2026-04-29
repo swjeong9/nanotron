@@ -11,6 +11,7 @@ export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-enp39s0}"
 export OMP_NUM_THREADS=4
+export PATH="$HOME/.local/bin:$PATH"
 
 uv run torchrun \
   --nproc_per_node=1 \
