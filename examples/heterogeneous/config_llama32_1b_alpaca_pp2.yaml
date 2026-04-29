@@ -2,7 +2,7 @@ checkpoints:
   checkpoint_interval: 200
   checkpoints_path: /opt/dlami/nvme/alpaca_pp2_ckpts
   checkpoints_path_is_shared_file_system: false
-  resume_checkpoint_path: /opt/dlami/nvme/llama32_1b_nanotron
+  resume_checkpoint_path: /opt/dlami/nvme/llama32_1b_nanotron/model
   save_initial_state: false
   load_lr_scheduler: false
   load_optimizer: false
