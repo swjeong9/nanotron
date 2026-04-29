@@ -1094,12 +1094,24 @@ class DistributedTrainer:
             config.optimizer.accumulate_grad_in_fp32 and config.optimizer.zero_stage > 0
         )
 
+        pp_layer_partition = parallel_config.pp_layer_partition
+        if pp_layer_partition is not None:
+            num_hidden_layers = getattr(self.model_config, "num_hidden_layers", None)
+            assert num_hidden_layers is not None, (
+                "pp_layer_partition requires the model config to expose num_hidden_layers"
+            )
+            assert sum(pp_layer_partition) == num_hidden_layers, (
+                f"sum(pp_layer_partition)={sum(pp_layer_partition)} != "
+                f"num_hidden_layers={num_hidden_layers}"
+            )
+
         # Build model and set pp ranks
         model = build_model(
             parallel_context=parallel_context,
             dtype=config.model.dtype,
             target_pp_ranks=target_pp_ranks,
             model_builder=model_builder,
+            pp_layer_partition=pp_layer_partition,
         )
 
         # Initialize rotary embeddings

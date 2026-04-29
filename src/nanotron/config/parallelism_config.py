@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from nanotron.config.utils_config import (
     cast_str_to_pipeline_engine,
@@ -24,6 +24,13 @@ class ParallelismArgs:
         tp_mode: TP mode to use between "all_reduce" and "reduce_scatter": all_reduce is normal, reduce_scatter activate sequence parallelism
         tp_linear_async_communication: Whether to use async communication in TP linear layers
         recompute_layer: Whether to recompute each Transformer layer to save memory.
+        pp_layer_partition: Optional list of decoder-layer counts per PP stage, e.g. [4, 8, 6]
+            for PP=3 with 18 decoder layers. When set, overrides the default
+            compute-cost-balanced split: only decoder layers are partitioned by the list,
+            embedding goes to stage 0 and final_layer_norm/lm_head/loss go to the last stage.
+            Must satisfy len == pp and sum == num_hidden_layers (the latter is checked once
+            the model config is available, in the trainer). Default None preserves the
+            existing cost-based behavior.
     """
 
     dp: int
@@ -38,6 +45,8 @@ class ParallelismArgs:
     expert_parallel_size: int = 1
     context_parallel_size: int = 1
 
+    pp_layer_partition: Optional[List[int]] = None
+
     def __post_init__(self):
         # Conservative defaults
         if self.pp_engine is None:
@@ -51,3 +60,11 @@ class ParallelismArgs:
             self.pp_engine = cast_str_to_pipeline_engine(self.pp_engine)
         if isinstance(self.tp_mode, str):
             self.tp_mode = TensorParallelLinearMode[self.tp_mode.upper()]
+
+        if self.pp_layer_partition is not None:
+            assert len(self.pp_layer_partition) == self.pp, (
+                f"pp_layer_partition has length {len(self.pp_layer_partition)} but pp={self.pp}"
+            )
+            assert all(n >= 1 for n in self.pp_layer_partition), (
+                f"pp_layer_partition entries must be >= 1, got {self.pp_layer_partition}"
+            )

@@ -190,8 +190,15 @@ def build_model(
     dtype: torch.dtype,
     target_pp_ranks: Optional[List[int]] = None,
     device: Optional[torch.device] = torch.device("cuda"),
+    pp_layer_partition: Optional[List[int]] = None,
 ) -> NanotronModel:
-    """Build the model and set the pp ranks for each pipeline block."""
+    """Build the model and set the pp ranks for each pipeline block.
+
+    If pp_layer_partition is given (a list of decoder-layer counts per stage, e.g. [4, 8, 6]),
+    decoder layers are split per the list, embedding goes to stage 0, and tail blocks
+    (final_layer_norm, lm_head, loss, ...) go to the last stage. Otherwise, the default
+    compute-cost-balanced split via model.get_block_compute_costs() is used.
+    """
     # TODO: classes dont take same args
     log_rank(
         "Building model", logger=logger, level=logging.INFO, rank=0, group=parallel_context.world_pg, is_separator=True
@@ -212,27 +219,69 @@ def build_model(
     with init_on_device_and_dtype(device=device, dtype=dtype):
         # TODO: https://github.com/huggingface/nanotron/issues/65
 
-        # Balance compute across PP blocks
-        block_compute_costs = model.get_block_compute_costs()
-        block_cumulative_costs = np.cumsum(
-            [
-                block_compute_costs[module.module_builder] if module.module_builder in block_compute_costs else 0
-                for module in pipeline_blocks
-            ]
-        )
+        if pp_layer_partition is not None:
+            # Manual partition: only decoder layers are distributed per the user-provided list.
+            # By convention each NanotronModel exposes `model.decoder` as an nn.ModuleList of
+            # decoder PipelineBlocks (Llama, Qwen2, Starcoder2 all follow this).
+            assert len(pp_layer_partition) == pp_size, (
+                f"pp_layer_partition length {len(pp_layer_partition)} != pp_size {pp_size}"
+            )
+            assert hasattr(model, "decoder"), (
+                f"{type(model).__name__} has no 'decoder' attribute; "
+                f"pp_layer_partition expects an nn.ModuleList of decoder PipelineBlocks."
+            )
+            decoder_block_ids = {id(b) for b in model.decoder}
+            decoder_block_idxs = [i for i, b in enumerate(pipeline_blocks) if id(b) in decoder_block_ids]
+            assert sum(pp_layer_partition) == len(decoder_block_idxs), (
+                f"sum(pp_layer_partition)={sum(pp_layer_partition)} != "
+                f"number of decoder blocks={len(decoder_block_idxs)}"
+            )
+            assert all(n >= 1 for n in pp_layer_partition), (
+                f"pp_layer_partition entries must be >= 1, got {pp_layer_partition}"
+            )
 
-        thresholds = [block_cumulative_costs[-1] * ((rank + 1) / pp_size) for rank in range(pp_size)]
-        assert thresholds[-1] >= block_cumulative_costs[-1]
-        target_pp_rank_idx = 0
-        for block, cumulative_cost in zip(pipeline_blocks, block_cumulative_costs):
-            assert target_pp_rank_idx < pp_size
-            block.build_and_set_rank(target_pp_ranks[target_pp_rank_idx])
+            decoder_to_stage = []
+            for stage, count in enumerate(pp_layer_partition):
+                decoder_to_stage.extend([stage] * count)
 
-            if cumulative_cost > thresholds[target_pp_rank_idx]:
-                target_pp_rank_idx += 1
+            decoder_idx_set = set(decoder_block_idxs)
+            first_dec = decoder_block_idxs[0]
+            decoder_iter = 0
 
-        model.input_pp_rank = target_pp_ranks[0]
-        model.output_pp_rank = target_pp_ranks[target_pp_rank_idx]
+            for i, block in enumerate(pipeline_blocks):
+                if i in decoder_idx_set:
+                    stage = decoder_to_stage[decoder_iter]
+                    decoder_iter += 1
+                elif i < first_dec:
+                    stage = 0  # pre-decoder blocks (e.g. embedding)
+                else:
+                    stage = pp_size - 1  # post-decoder blocks (final_norm, lm_head, loss, ...)
+                block.build_and_set_rank(target_pp_ranks[stage])
+
+            model.input_pp_rank = target_pp_ranks[0]
+            model.output_pp_rank = target_pp_ranks[pp_size - 1]
+        else:
+            # Default: balance compute across PP blocks
+            block_compute_costs = model.get_block_compute_costs()
+            block_cumulative_costs = np.cumsum(
+                [
+                    block_compute_costs[module.module_builder] if module.module_builder in block_compute_costs else 0
+                    for module in pipeline_blocks
+                ]
+            )
+
+            thresholds = [block_cumulative_costs[-1] * ((rank + 1) / pp_size) for rank in range(pp_size)]
+            assert thresholds[-1] >= block_cumulative_costs[-1]
+            target_pp_rank_idx = 0
+            for block, cumulative_cost in zip(pipeline_blocks, block_cumulative_costs):
+                assert target_pp_rank_idx < pp_size
+                block.build_and_set_rank(target_pp_ranks[target_pp_rank_idx])
+
+                if cumulative_cost > thresholds[target_pp_rank_idx]:
+                    target_pp_rank_idx += 1
+
+            model.input_pp_rank = target_pp_ranks[0]
+            model.output_pp_rank = target_pp_ranks[target_pp_rank_idx]
 
     if pp_size > 1:
         model.log_modules(level=logging.INFO, group=parallel_context.world_pg, rank=0)
