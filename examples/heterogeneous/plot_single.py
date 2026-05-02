@@ -53,15 +53,34 @@ LLAMA32_1B_PARAMS = 1.236e9      # ~1.24 B (embedding + decoder; lm_head 는 tie
 LLAMA32_1B_EMBED_PARAMS = LLAMA32_1B_VOCAB * LLAMA32_1B_HIDDEN
 LLAMA32_1B_DECODER_PARAMS_PER_LAYER = (LLAMA32_1B_PARAMS - LLAMA32_1B_EMBED_PARAMS) / LLAMA32_1B_NUM_LAYERS
 
-# 학습 step time 의 "전형적" 추정 (실측 기준 — project_background.md §6.1.1).
-# 일반 dense matmul 에서 sustainable 한 값 — peak 의 25-50% 정도.
-L4_BF16_TFLOPS = 30
-A10G_BF16_TFLOPS = 70  # NVIDIA spec (FP16); A10G 는 BF16 도 동일.
-# MFU 계산용 peak BF16 dense TC — NVIDIA datasheet 의 sparse 미적용 수치.
-# - L4 (AD104, Ada): BF16 TC dense = 121 TFLOPs
-# - A10G (GA102, Ampere): BF16 TC dense = 125 TFLOPs (FP16 와 동일)
-L4_BF16_PEAK_TFLOPS = 121
-A10G_BF16_PEAK_TFLOPS = 125
+# GPU spec 테이블 — meta.json 의 ``gpu_node{0,1}`` 문자열에서 GPU type 을 파싱해 lookup.
+# - peak_bf16_tflops: NVIDIA datasheet dense BF16/FP16 TC (sparsity 미적용).
+# - sustained_bf16_tflops: 일반 dense matmul 에서 실측 가능한 sustained 값. peak 의 25-50%.
+# - tdp_w: NVIDIA datasheet TDP (datacenter spec).
+GPU_SPECS = {
+    "L4":   {"peak_bf16_tflops": 121,   "sustained_bf16_tflops": 30,  "tdp_w": 72},
+    "L40S": {"peak_bf16_tflops": 362,   "sustained_bf16_tflops": 100, "tdp_w": 350},
+    "A10G": {"peak_bf16_tflops": 125,   "sustained_bf16_tflops": 70,  "tdp_w": 150},
+    "A100": {"peak_bf16_tflops": 312,   "sustained_bf16_tflops": 200, "tdp_w": 400},
+    "H100": {"peak_bf16_tflops": 989,   "sustained_bf16_tflops": 600, "tdp_w": 700},
+    # V100 SXM2 32GB (Volta) — BF16 미지원이지만 FP16 Tensor Core 가 동일 throughput.
+    # peak field 는 cluster 가 사용하는 dtype 의 peak TC TFLOPS 의미 (V100 cluster 는 FP16).
+    "V100": {"peak_bf16_tflops": 125,   "sustained_bf16_tflops": 70,  "tdp_w": 300},
+}
+GPU_TYPE_PATTERN = re.compile(
+    r"\b(H100|A100|A10G|L40S|L4|V100)\b"   # longest-first 조심
+)
+
+
+def parse_gpu_type(meta: dict, node_idx: int) -> str:
+    """meta['gpu_node{idx}'] 문자열에서 GPU type 추출. 매칭 실패 시 'GPU' fallback."""
+    s = meta.get(f"gpu_node{node_idx}", "")
+    m = GPU_TYPE_PATTERN.search(s)
+    return m.group(1) if m else "GPU"
+
+
+def gpu_spec(gpu_type: str, key: str, default=0):
+    return GPU_SPECS.get(gpu_type, {}).get(key, default)
 # AWS g5.xlarge / g6.xlarge 의 ENA 네트워크 대역폭.
 # - "Up to 10 Gbps" 가 datasheet spec 이지만 이는 **burst credit** (24h 당 ~30분).
 # - **sustained baseline 은 1.25 Gbps = 156 MB/s** (small instance 공통). 5-10분
@@ -100,32 +119,64 @@ def extract_step_timings(log_path: Path) -> List[float]:
 _MODEL_FLOPS_RE = re.compile(r"\[ModelFLOPs\]\s+(\w+)=(\d+)")
 _STAGE_FLOPS_RE = re.compile(r"\[StageFLOPs\]\s+stage\s+(\d+):\s+cost=(\d+)\s+\(([\d.]+)%\)\s+modules=\[([^\]]*)\]")
 _MEM_RE = re.compile(
-    r"Memory usage:\s*([\d.]+)MiB\.\s*Peak allocated\s*([\d.]+)MiB\.\s*Peak reserved:\s*([\d.]+)MiB"
+    r"Memory usage:\s*([\d.]+)MiB\.\s*Peak allocated:?\s*([\d.]+)MiB\.?\s*Peak reserved:\s*([\d.]+)MiB"
 )
+# nanotron 의 INFO 라인은 ``[INFO|PP=N|TP=M]`` 으로 rank 정보 인코딩.
+# log_memory (logging/base.py) 가 ``[rank N]`` 명시 접두사를 붙이는 경우도 있음.
+_PPTP_RE = re.compile(r"\[INFO\|PP=(\d+)\|TP=(\d+)\]")
+_RANK_PREFIX_RE = re.compile(r"\[rank (\d+)\]")
 
 
 def extract_memory_peaks(log_path: Path) -> dict:
-    """``Memory usage / Peak allocated / Peak reserved`` 줄을 파싱해 max 추출.
+    """``Memory usage / Peak allocated / Peak reserved`` 줄을 (PP, TP) 별 파싱.
 
-    return: ``{"max_live_MiB": ..., "max_alloc_MiB": ..., "max_reserved_MiB": ...}``
+    rank 라벨 우선순위:
+      1) ``[rank N]`` (logging/base.py 의 log_memory 명시 접두사 — single-GPU 호환)
+      2) ``[INFO|PP=N|TP=M]`` (nanotron 의 표준 INFO 라인 형식)
+
+    multi-GPU 노드 (TP=4 등) 에선 4 rank 가 각자 log → per-rank dict 에 4 entry.
+
+    return:
+      ``{"per_rank": {"pp0_tp0": {max_live_MiB, max_alloc_MiB, max_reserved_MiB}, ...},
+         "max_live_MiB": <max across ranks>, ...}``
     """
     if not log_path.exists():
         return {}
-    max_live = max_alloc = max_reserved = 0.0
+    per_rank = {}
     for line in log_path.read_text(errors="ignore").splitlines():
         m = _MEM_RE.search(line)
-        if m:
-            live, alloc, reserved = float(m.group(1)), float(m.group(2)), float(m.group(3))
-            max_live = max(max_live, live)
-            max_alloc = max(max_alloc, alloc)
-            max_reserved = max(max_reserved, reserved)
-    if max_reserved == 0:
+        if not m:
+            continue
+        rank_match = _RANK_PREFIX_RE.search(line)
+        if rank_match:
+            rank = f"rank{rank_match.group(1)}"
+        else:
+            pptp_match = _PPTP_RE.search(line)
+            if pptp_match:
+                rank = f"pp{pptp_match.group(1)}_tp{pptp_match.group(2)}"
+            else:
+                rank = "unknown"
+        live, alloc, reserved = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        cur = per_rank.setdefault(rank, {"max_live": 0.0, "max_alloc": 0.0, "max_reserved": 0.0})
+        cur["max_live"] = max(cur["max_live"], live)
+        cur["max_alloc"] = max(cur["max_alloc"], alloc)
+        cur["max_reserved"] = max(cur["max_reserved"], reserved)
+    if not per_rank:
         return {}
-    return {
-        "max_live_MiB": round(max_live, 1),
-        "max_alloc_MiB": round(max_alloc, 1),
-        "max_reserved_MiB": round(max_reserved, 1),
+    out = {
+        "per_rank": {
+            rank: {
+                "max_live_MiB": round(v["max_live"], 1),
+                "max_alloc_MiB": round(v["max_alloc"], 1),
+                "max_reserved_MiB": round(v["max_reserved"], 1),
+            }
+            for rank, v in sorted(per_rank.items())
+        },
+        "max_live_MiB": round(max(v["max_live"] for v in per_rank.values()), 1),
+        "max_alloc_MiB": round(max(v["max_alloc"] for v in per_rank.values()), 1),
+        "max_reserved_MiB": round(max(v["max_reserved"] for v in per_rank.values()), 1),
     }
+    return out
 
 
 def extract_flops_log(log_path: Path) -> dict:
@@ -273,8 +324,287 @@ def mean_safe(xs):
     return statistics.mean(xs) if xs else None
 
 
+def aggregate_dcgm_per_gpu(rows: List[dict]) -> dict:
+    """Group DCGM samples by 'entity' (GPU 0..N-1), compute avg/max for key metrics.
+
+    Caller responsible for time/active filtering before passing rows in.
+    Returns {entity_str: {avg_power_W, max_power_W, avg_temp_C, max_temp_C,
+                          avg_SMACT, avg_TENSO, avg_DRAMA, n_samples}}.
+    """
+    from collections import defaultdict
+    by_gpu = defaultdict(list)
+    for r in rows:
+        ent = r.get("entity")
+        if ent:
+            by_gpu[ent].append(r)
+    out = {}
+    for gpu in sorted(by_gpu):
+        xs = by_gpu[gpu]
+        out[gpu] = {
+            "avg_power_W": round(mean_safe(r.get("POWER") for r in xs) or 0, 2),
+            "max_power_W": round(max((r.get("POWER", 0) for r in xs), default=0), 2),
+            "avg_temp_C": round(mean_safe(r.get("TMPTR") for r in xs) or 0, 1),
+            "max_temp_C": round(max((r.get("TMPTR", 0) for r in xs), default=0), 1),
+            "avg_SMACT": round(mean_safe(r.get("SMACT") for r in xs) or 0, 4),
+            "avg_TENSO": round(mean_safe(r.get("TENSO") for r in xs) or 0, 4),
+            "avg_DRAMA": round(mean_safe(r.get("DRAMA") for r in xs) or 0, 4),
+            "n_samples": len(xs),
+        }
+    return out
+
+
+def parse_nvidia_smi_per_gpu(path: Path) -> List[List[float]]:
+    """``ts gpu0,gpu1,gpu2,gpu3`` (4-GPU TP=4 노드의 comma-separated mem.used MiB).
+
+    Returns: list of [gpu0, gpu1, gpu2, gpu3] per sample row.
+    Single-GPU 노드면 [val] 만 들어 있어 호환됨.
+    """
+    if not path.exists():
+        return []
+    samples = []
+    for line in path.read_text(errors="ignore").splitlines():
+        toks = line.split()
+        if len(toks) < 2:
+            continue
+        try:
+            vals = [float(v) for v in toks[1].split(",")]
+            samples.append(vals)
+        except (ValueError, IndexError):
+            continue
+    return samples
+
+
+def per_gpu_max_nvsmi(samples: List[List[float]]) -> List[float]:
+    """각 GPU index 별로 모든 sample 의 max.
+
+    sanity bound: nvidia-smi sampler 의 race condition 으로 newline 손실 시 mem 값이
+    다음 라인 timestamp 와 concat 되어 ~10^15 같은 garbage 발생. GPU 메모리는
+    물리적으로 100 GB 이하라 100,000 MiB 초과 sample 은 corrupt 로 간주하고 제외.
+    """
+    if not samples:
+        return []
+    n_gpus = max(len(s) for s in samples)
+    SANITY_MAX_MIB = 100_000  # 100 GB / GPU 이상이면 corrupt
+    return [
+        round(max((s[i] for s in samples if i < len(s) and s[i] < SANITY_MAX_MIB), default=0), 1)
+        for i in range(n_gpus)
+    ]
+
+
 # =============================================================================
-# Plot
+# Plot helpers
+# =============================================================================
+def _group_dcgm_by_gpu(rows: List[dict]) -> dict:
+    """{'GPU 0': [row, row, ...], 'GPU 1': [...], ...}"""
+    from collections import defaultdict
+    out = defaultdict(list)
+    for r in rows:
+        ent = r.get("entity")
+        if ent:
+            out[ent].append(r)
+    return dict(sorted(out.items()))
+
+
+def _add_step_boundary_lines(ax, step_boundaries, t0):
+    """모든 axis 에 step boundary vertical line 추가."""
+    if not step_boundaries:
+        return
+    for i, (b, fb_end, step_end) in enumerate(step_boundaries):
+        ax.axvline(b - t0, color="green", linestyle="--", alpha=0.5, linewidth=0.7)
+        ax.axvline(fb_end - t0, color="tab:orange", linestyle=":", alpha=0.4, linewidth=0.6)
+        if i == len(step_boundaries) - 1:
+            ax.axvline(step_end - t0, color="red", linestyle="--", alpha=0.7, linewidth=1.0)
+        else:
+            ax.axvline(step_end - t0, color="grey", linestyle="--", alpha=0.5, linewidth=0.7)
+
+
+def _dcgm_align_t(rows, dcgm_start_unix, train_start_unix):
+    """DCGM row → x (학습 시작 = 0).
+
+    DCGM ``ts`` 두 가지 포맷 지원:
+    - **wallclock** (값이 unix epoch, > 1e9): dcgm_dmon_wrap.sh prefix 모드 → 직접 빼면 됨
+    - **sample_idx** (값이 작은 정수, < 1e9): 옛 awk 모드, dcgm_start 기준 상대 초로 가정
+    """
+    if not rows:
+        return []
+    is_wallclock = rows[0].get("ts", 0) > 1e9
+    if is_wallclock:
+        return [r["ts"] - train_start_unix for r in rows]
+    if dcgm_start_unix and dcgm_start_unix > 0 and train_start_unix > 0:
+        offset_sec = train_start_unix - dcgm_start_unix
+        return [r["ts"] - offset_sec for r in rows]
+    boost = [i for i, r in enumerate(rows) if r.get("SMCLK", 0) > 1500]
+    offset = boost[0] if boost else 0
+    return [r["ts"] - offset for r in rows]
+
+
+def _dcgm_ts_to_unix(r, dcgm_start_unix):
+    """DCGM row 의 ``ts`` field 를 unix epoch 로 변환 (포맷 자동 감지)."""
+    ts = r.get("ts", 0)
+    return ts if ts > 1e9 else dcgm_start_unix + ts
+
+
+def plot_per_gpu_metric(
+    meta: dict,
+    dcgm0: List[dict], dcgm1: List[dict],
+    step_boundaries,
+    metric_key: str,
+    ylabel: str,
+    title: str,
+    out_path: Path,
+):
+    """N (NODE 0 GPU) + N (NODE 1 GPU) 의 metric 시계열을 2N subplot 으로.
+
+    layout: 2 row × N col.  row 0 = NODE 0, row 1 = NODE 1.
+    GPU type 라벨은 ``meta['gpu_node{0,1}']`` 에서 자동 추출.
+
+    metric_key: DCGM column name (e.g. "POWER", "TMPTR", "SMACT", "TENSO", "DRAMA").
+    """
+    gpu_type_n0 = parse_gpu_type(meta, 0)
+    gpu_type_n1 = parse_gpu_type(meta, 1)
+    by_gpu0 = _group_dcgm_by_gpu(dcgm0)
+    by_gpu1 = _group_dcgm_by_gpu(dcgm1)
+    n_gpus = max(len(by_gpu0), len(by_gpu1), 1)
+
+    fig, axes = plt.subplots(2, n_gpus, figsize=(4 * n_gpus, 5.5),
+                              sharex=True, sharey=True, squeeze=False)
+    fig.suptitle(f"{title} | {meta.get('descriptor', '?')} | "
+                 f"NODE 0 = {gpu_type_n0}, NODE 1 = {gpu_type_n1}", fontsize=11)
+
+    train_start = step_boundaries[0][0] if step_boundaries else 0
+    dcgm_start_n0 = float(meta.get("dcgm_start_ts_node0") or 0)
+    dcgm_start_n1 = float(meta.get("dcgm_start_ts_node1") or 0)
+
+    def _plot_one(ax, gpu_rows, dcgm_start, color, label):
+        if not gpu_rows:
+            ax.set_visible(False)
+            return
+        t = _dcgm_align_t(gpu_rows, dcgm_start, train_start)
+        ax.plot(t, [r.get(metric_key, 0) for r in gpu_rows], color=color, linewidth=0.8)
+        ax.set_title(label, fontsize=9)
+        ax.grid(True, alpha=0.3)
+        _add_step_boundary_lines(ax, step_boundaries, train_start)
+
+    for col, (gpu, rows) in enumerate(by_gpu0.items()):
+        _plot_one(axes[0][col], rows, dcgm_start_n0, "tab:blue", f"{gpu_type_n0} / {gpu}")
+    for col, (gpu, rows) in enumerate(by_gpu1.items()):
+        _plot_one(axes[1][col], rows, dcgm_start_n1, "tab:orange", f"{gpu_type_n1} / {gpu}")
+
+    for ax in axes[0]:
+        ax.set_ylabel(ylabel) if ax == axes[0][0] else None
+    for ax in axes[1]:
+        ax.set_xlabel("elapsed [s] from training start")
+        ax.set_ylabel(ylabel) if ax == axes[1][0] else None
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+def plot_node_bandwidth(meta, dcgm0, dcgm1, nic0, nic1, step_boundaries, out_path: Path):
+    """Node-level 시계열 — NIC (TX/RX), PCIe (TX/RX, GPU↔CPU mean across 4 GPU),
+    DRAM bandwidth (mean across 4 GPU).
+
+    PCIe / DRAM 은 GPU 별이지만 node 합/평균 으로 간략화. node 단위가 핵심.
+    """
+    gpu_type_n0 = parse_gpu_type(meta, 0)
+    gpu_type_n1 = parse_gpu_type(meta, 1)
+    fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+    fig.suptitle(f"Node-level bandwidth | mbs={meta['mbs']} ga={meta['ga']} "
+                 f"seq={meta['seq_len']} | NODE 0 = {gpu_type_n0} / NODE 1 = {gpu_type_n1}", fontsize=11)
+
+    train_start = step_boundaries[0][0] if step_boundaries else 0
+    dcgm_start_n0 = float(meta.get("dcgm_start_ts_node0") or 0)
+    dcgm_start_n1 = float(meta.get("dcgm_start_ts_node1") or 0)
+
+    # Per-GPU rows → group by ts, then avg/sum.
+    def _by_ts(rows):
+        from collections import defaultdict
+        out = defaultdict(list)
+        for r in rows:
+            out[r["ts"]].append(r)
+        return out
+
+    def _node_mean_at_each_ts(rows, key):
+        """Returns (ts_list, mean_list) — at each ts, mean across all GPUs of that node."""
+        tsd = _by_ts(rows)
+        ts_sorted = sorted(tsd.keys())
+        return ts_sorted, [mean_safe(r.get(key, 0) for r in tsd[t]) or 0 for t in ts_sorted]
+
+    def _node_sum_at_each_ts(rows, key):
+        """Sum across GPUs (PCIe/DRAM은 합으로 보는 게 직관적)."""
+        tsd = _by_ts(rows)
+        ts_sorted = sorted(tsd.keys())
+        return ts_sorted, [sum(r.get(key, 0) for r in tsd[t]) for t in ts_sorted]
+
+    # (1) DRAM bandwidth (mean across 4 GPU per node)
+    if dcgm0:
+        ts0, vals = _node_mean_at_each_ts(dcgm0, "DRAMA")
+        x0 = _dcgm_align_t([{"ts": t} for t in ts0], dcgm_start_n0, train_start)
+        axes[0].plot(x0, vals, label=f"NODE 0 ({gpu_type_n0}) mean", color="tab:blue")
+    if dcgm1:
+        ts1, vals = _node_mean_at_each_ts(dcgm1, "DRAMA")
+        x1 = _dcgm_align_t([{"ts": t} for t in ts1], dcgm_start_n1, train_start)
+        axes[0].plot(x1, vals, label=f"NODE 1 ({gpu_type_n1}) mean", color="tab:orange")
+    axes[0].set_ylabel("DRAM bandwidth\n(DCGM DRAMA, 0..1; mean across GPUs)")
+    axes[0].legend(loc="upper right", fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    # (2) PCIe TX+RX (sum across 4 GPU per node)
+    if dcgm0:
+        ts0, tx_sum = _node_sum_at_each_ts(dcgm0, "PCITX")
+        _, rx_sum = _node_sum_at_each_ts(dcgm0, "PCIRX")
+        x0 = _dcgm_align_t([{"ts": t} for t in ts0], dcgm_start_n0, train_start)
+        axes[1].plot(x0, [v / 1e6 for v in tx_sum], label="NODE 0 PCITX (sum)",
+                     color="tab:blue", linestyle="--")
+        axes[1].plot(x0, [v / 1e6 for v in rx_sum], label="NODE 0 PCIRX (sum)",
+                     color="tab:blue", linestyle=":")
+    if dcgm1:
+        ts1, tx_sum = _node_sum_at_each_ts(dcgm1, "PCITX")
+        _, rx_sum = _node_sum_at_each_ts(dcgm1, "PCIRX")
+        x1 = _dcgm_align_t([{"ts": t} for t in ts1], dcgm_start_n1, train_start)
+        axes[1].plot(x1, [v / 1e6 for v in tx_sum], label="NODE 1 PCITX (sum)",
+                     color="tab:orange", linestyle="--")
+        axes[1].plot(x1, [v / 1e6 for v in rx_sum], label="NODE 1 PCIRX (sum)",
+                     color="tab:orange", linestyle=":")
+    axes[1].set_ylabel("PCIe (GPU↔CPU)\n[MB/s; sum across GPUs]")
+    axes[1].legend(loc="upper right", fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    # (3) NIC actual bandwidth (per-node, /proc/net/dev, no per-GPU)
+    nic0_rate = nic_to_rate(nic0)
+    nic1_rate = nic_to_rate(nic1)
+    if nic0_rate:
+        x = [r["ts"] - train_start for r in nic0_rate]
+        axes[2].plot(x, [r["tx_MBps"] for r in nic0_rate], label="NODE 0 TX",
+                     color="tab:blue", linestyle="--")
+        axes[2].plot(x, [r["rx_MBps"] for r in nic0_rate], label="NODE 0 RX",
+                     color="tab:blue", linestyle=":")
+    if nic1_rate:
+        x = [r["ts"] - train_start for r in nic1_rate]
+        axes[2].plot(x, [r["tx_MBps"] for r in nic1_rate], label="NODE 1 TX",
+                     color="tab:orange", linestyle="--")
+        axes[2].plot(x, [r["rx_MBps"] for r in nic1_rate], label="NODE 1 RX",
+                     color="tab:orange", linestyle=":")
+    axes[2].axhline(ENA_BURST_GBPS * 125, color="red", linestyle=":", alpha=0.5,
+                    label=f"ENA burst ({ENA_BURST_GBPS} Gbps)")
+    axes[2].axhline(ENA_BASELINE_GBPS * 125, color="purple", linestyle=":", alpha=0.5,
+                    label=f"ENA baseline ({ENA_BASELINE_GBPS} Gbps)")
+    axes[2].set_ylabel("NIC bandwidth\n(/proc/net/dev) [MB/s]")
+    axes[2].set_xlabel("elapsed [s] from training start")
+    axes[2].legend(loc="upper right", fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+
+    for ax in axes:
+        _add_step_boundary_lines(ax, step_boundaries, train_start)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+# =============================================================================
+# Plot (legacy combined timeseries — kept for backward compat, not used in main)
 # =============================================================================
 def plot_timeseries(meta: dict, dcgm0, dcgm1, nic0, nic1, step_boundaries, out_path: Path):
     """모든 subplot 의 x=0 을 ``첫 학습 step 의 Before train_batch_iter`` 시점
@@ -289,10 +619,12 @@ def plot_timeseries(meta: dict, dcgm0, dcgm1, nic0, nic1, step_boundaries, out_p
       ``dcgm_start_ts`` 가 meta 에 없는 경우엔 ``첫 SMCLK boost row``
       휴리스틱으로 fallback (구식 run 결과 호환용).
     """
+    gpu_type_n0 = parse_gpu_type(meta, 0)
+    gpu_type_n1 = parse_gpu_type(meta, 1)
     fig, axes = plt.subplots(7, 1, figsize=(13, 16), sharex=True)
     fig.suptitle(f"Single run | mbs={meta['mbs']} ga={meta['ga']} seq={meta['seq_len']} "
                  f"(GBS={meta['gbs_seqs']} sequences = {meta['gbs_tokens_per_step']} tokens / step) | "
-                 f"NODE 0 = L4 / NODE 1 = A10G")
+                 f"NODE 0 = {gpu_type_n0} / NODE 1 = {gpu_type_n1}")
 
     # 학습 시작 unix (없으면 NIC 첫 active sample fallback)
     if step_boundaries:
@@ -303,18 +635,7 @@ def plot_timeseries(meta: dict, dcgm0, dcgm1, nic0, nic1, step_boundaries, out_p
         train_start_unix = 0
 
     def _dcgm_align(rows, dcgm_start_unix):
-        """DCGM row_index → t (학습 시작 = 0)."""
-        if not rows:
-            return []
-        if dcgm_start_unix and dcgm_start_unix > 0 and train_start_unix > 0:
-            # row_idx 가 dcgmi 시작 후 elapsed sec (1 Hz polling).
-            # x = (dcgmi_start_unix + row_idx) - train_start_unix
-            offset_sec = train_start_unix - dcgm_start_unix
-            return [r["ts"] - offset_sec for r in rows]
-        # Fallback: first-SMCLK-boost row → t=0
-        boost = [i for i, r in enumerate(rows) if r.get("SMCLK", 0) > 1500]
-        offset = boost[0] if boost else 0
-        return [r["ts"] - offset for r in rows]
+        return _dcgm_align_t(rows, dcgm_start_unix, train_start_unix)
 
     def _nic_align(rows):
         return [r["ts"] - train_start_unix for r in rows]
@@ -330,9 +651,9 @@ def plot_timeseries(meta: dict, dcgm0, dcgm1, nic0, nic1, step_boundaries, out_p
 
     # (1) Power
     if dcgm0:
-        axes[0].plot(t_d0, [r["POWER"] for r in dcgm0], label="NODE 0 (L4)", color="tab:blue")
+        axes[0].plot(t_d0, [r["POWER"] for r in dcgm0], label=f"NODE 0 ({gpu_type_n0})", color="tab:blue")
     if dcgm1:
-        axes[0].plot(t_d1, [r["POWER"] for r in dcgm1], label="NODE 1 (A10G)", color="tab:orange")
+        axes[0].plot(t_d1, [r["POWER"] for r in dcgm1], label=f"NODE 1 ({gpu_type_n1})", color="tab:orange")
     axes[0].set_ylabel("GPU power [W]")
     axes[0].legend(loc="upper right")
     axes[0].grid(True, alpha=0.3)
@@ -510,16 +831,31 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
 
     flops_total = sum(flops_per_stage)
     cluster_achieved_tflops = flops_total / steady_total / 1e12
-    cluster_peak_tflops = L4_BF16_PEAK_TFLOPS + A10G_BF16_PEAK_TFLOPS
+    # TP-aware + node-aware peak: 각 노드의 GPU 수 = (pp/nodes) × tp = stages_per_node × tp.
+    # 본 cluster 는 2 노드 fixed → 각 노드 GPU = pp × tp / 2.
+    # 이전에는 stage 당 GPU (= tp) 만 곱해 PP>2 인 경우 cluster peak 가 실제의 절반/¼/⅛ 로 underestimate.
+    tp = int(meta.get("tp", 1) or 1)
+    pp = int(meta.get("pp", len(flops_per_stage)) or 1)
+    gpu_type_n0 = parse_gpu_type(meta, 0)
+    gpu_type_n1 = parse_gpu_type(meta, 1)
+    peak_n0 = gpu_spec(gpu_type_n0, "peak_bf16_tflops", 1)
+    peak_n1 = gpu_spec(gpu_type_n1, "peak_bf16_tflops", 1)
+    n_n0_gpus = (pp * tp) // 2                  # NODE 0 의 총 GPU (stages_per_node × tp)
+    n_n1_gpus = (pp * tp) // 2                  # NODE 1 의 총 GPU
+    cluster_peak_tflops = n_n0_gpus * peak_n0 + n_n1_gpus * peak_n1
     mfu_cluster = cluster_achieved_tflops / cluster_peak_tflops
 
-    # Per-stage MFU = (per-stage achieved TFLOPs/s) / per-GPU peak.
-    # Steady-state 1F1B 에서 양 stage 가 같은 wall-clock 으로 진행하므로
-    # per-stage 시간 = step time. 따라서 per-stage achieved = stage_FLOPs / step_time.
-    achieved_l4_tflops = flops_per_stage[0] / steady_total / 1e12
-    achieved_a10g_tflops = flops_per_stage[1] / steady_total / 1e12
-    mfu_l4 = achieved_l4_tflops / L4_BF16_PEAK_TFLOPS
-    mfu_a10g = achieved_a10g_tflops / A10G_BF16_PEAK_TFLOPS
+    # Per-node achieved TFLOPS = 노드 측 stage 들의 FLOPs 합 / step_time.
+    # 1F1B steady-state 에서 모든 stage 의 wall-clock 동일하므로 step_time 으로 나눔.
+    half = pp // 2
+    flops_n0_stage = sum(flops_per_stage[:half]) if half else flops_per_stage[0]
+    flops_n1_stage = sum(flops_per_stage[half:]) if half else flops_per_stage[-1]
+    achieved_n0_stage_tflops = flops_n0_stage / steady_total / 1e12
+    achieved_n1_stage_tflops = flops_n1_stage / steady_total / 1e12
+    achieved_n0_per_gpu = achieved_n0_stage_tflops / n_n0_gpus
+    achieved_n1_per_gpu = achieved_n1_stage_tflops / n_n1_gpus
+    mfu_n0 = achieved_n0_per_gpu / peak_n0
+    mfu_n1 = achieved_n1_per_gpu / peak_n1
 
     # Power: 다른 metric 과 동일하게 steady-state (step 2..N) wallclock 윈도우만 평균.
     # SMCLK boost heuristic 은 warmup + cleanup 포함이라 더 넓음 → 일관성 유지 위해 동일 윈도우 사용.
@@ -536,20 +872,20 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
         if not rows or not dcgm_start_unix:
             return rows
         return [r for r in rows
-                if steady_t0_unix <= dcgm_start_unix + r["ts"] <= steady_t1_unix]
+                if steady_t0_unix <= _dcgm_ts_to_unix(r, dcgm_start_unix) <= steady_t1_unix]
 
     dcgm_start_n0 = float(meta.get("dcgm_start_ts_node0") or 0)
     dcgm_start_n1 = float(meta.get("dcgm_start_ts_node1") or 0)
     n0_steady = _dcgm_in_steady(dcgm0, dcgm_start_n0)
     n1_steady = _dcgm_in_steady(dcgm1, dcgm_start_n1)
-    avg_power_l4 = mean_safe(r["POWER"] for r in n0_steady) if n0_steady else 0
-    avg_power_a10g = mean_safe(r["POWER"] for r in n1_steady) if n1_steady else 0
+    avg_power_n0 = mean_safe(r["POWER"] for r in n0_steady) if n0_steady else 0
+    avg_power_n1 = mean_safe(r["POWER"] for r in n1_steady) if n1_steady else 0
 
     partition_str = "-".join(str(n) for n in pp_partition)
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
     fig.suptitle(f"Single run summary (step 2..{len(step_boundaries)} steady-state) | "
                  f"mbs={meta['mbs']} ga={meta['ga']} GBS={meta['gbs_seqs']} "
-                 f"split={partition_str} | NODE 0 = L4 / NODE 1 = A10G")
+                 f"split={partition_str} | NODE 0 = {gpu_type_n0} / NODE 1 = {gpu_type_n1}")
 
     # (1) Throughput
     bars1 = axes[0].bar([f"split {partition_str}"], [throughput_tps],
@@ -561,48 +897,76 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
                      ha="center", va="bottom", fontsize=9)
     axes[0].set_ylim(0, throughput_tps * 1.25)
 
-    # (2) MFU. xticks = "cluster" / "L4:0" / "A10G:0" (NUM 은 같은 노드 내 GPU index;
-    # PP=2 single GPU/node 환경에서는 모두 0 — single-node multi-GPU 실험으로
-    # 확장될 때 의미 있어짐).
-    mfu_vals = [mfu_cluster * 100, mfu_l4 * 100, mfu_a10g * 100]
-    mfu_xticks = ["cluster", "L4:0", "A10G:0"]
-    bars2 = axes[1].bar(mfu_xticks, mfu_vals,
-                        color=["tab:gray", "tab:blue", "tab:orange"], width=0.6)
+    # (2) MFU per-GPU. 한 stage 의 TP GPU 가 균등 sharding → 모두 동일한 per-GPU MFU.
+    # cluster MFU + (n_n0 + n_n1) GPU MFU = (1 + 2*tp) bars.
+    mfu_vals = [mfu_cluster * 100]
+    mfu_xticks = ["cluster"]
+    mfu_colors = ["tab:gray"]
+    for i in range(n_n0_gpus):
+        mfu_vals.append(mfu_n0 * 100)
+        mfu_xticks.append(f"{gpu_type_n0}:{i}")
+        mfu_colors.append("tab:blue")
+    for i in range(n_n1_gpus):
+        mfu_vals.append(mfu_n1 * 100)
+        mfu_xticks.append(f"{gpu_type_n1}:{i}")
+        mfu_colors.append("tab:orange")
+    bars2 = axes[1].bar(mfu_xticks, mfu_vals, color=mfu_colors, width=0.7)
     axes[1].set_ylabel("MFU [%]")
-    axes[1].set_title("Model FLOPs Utilization (MFU)")
+    axes[1].set_title("Model FLOPs Utilization (per-GPU)")
     for b, v in zip(bars2, mfu_vals):
         axes[1].text(b.get_x() + b.get_width() / 2, v, f"{v:.1f}%",
-                     ha="center", va="bottom", fontsize=9)
-    axes[1].set_ylim(0, max(50, max(mfu_vals) * 1.2))
+                     ha="center", va="bottom", fontsize=8)
+    axes[1].set_ylim(0, max(50, max(mfu_vals) * 1.25))
+    axes[1].tick_params(axis="x", rotation=30, labelsize=8)
     legend_handles = [
         plt.Line2D([0], [0], color="tab:gray", lw=8,
-                   label=f"cluster ({cluster_achieved_tflops:.1f} / {cluster_peak_tflops} TFLOPS)"),
+                   label=f"cluster ({cluster_achieved_tflops:.1f}/{cluster_peak_tflops:.0f} TF/s)"),
         plt.Line2D([0], [0], color="tab:blue", lw=8,
-                   label=f"L4 ({achieved_l4_tflops:.1f} / {L4_BF16_PEAK_TFLOPS} TFLOPS)"),
+                   label=f"{gpu_type_n0} each ({achieved_n0_per_gpu:.1f}/{peak_n0} TF/s)"),
         plt.Line2D([0], [0], color="tab:orange", lw=8,
-                   label=f"A10G ({achieved_a10g_tflops:.1f} / {A10G_BF16_PEAK_TFLOPS} TFLOPS)"),
+                   label=f"{gpu_type_n1} each ({achieved_n1_per_gpu:.1f}/{peak_n1} TF/s)"),
     ]
-    axes[1].legend(handles=legend_handles, loc="upper right", fontsize=8)
+    axes[1].legend(handles=legend_handles, loc="upper right", fontsize=7)
 
-    # (3) Average power per node — same xticks scheme.
-    power_vals = [avg_power_l4, avg_power_a10g]
-    power_xticks = ["L4:0", "A10G:0"]
-    bars3 = axes[2].bar(power_xticks, power_vals,
-                        color=["tab:blue", "tab:orange"], width=0.6)
+    # (3) Average power per GPU — TP=N 이라 NODE 0 GPU 0..N-1 + NODE 1 GPU 0..N-1 합 2N bars.
+    by_gpu0 = _group_dcgm_by_gpu(n0_steady)
+    by_gpu1 = _group_dcgm_by_gpu(n1_steady)
+
+    power_xticks, power_vals, bar_colors = [], [], []
+    for gpu, rows in by_gpu0.items():
+        idx = gpu.split()[-1]                        # "GPU 0" → "0"
+        power_xticks.append(f"{gpu_type_n0}:{idx}")
+        power_vals.append(mean_safe(r["POWER"] for r in rows) or 0)
+        bar_colors.append("tab:blue")
+    for gpu, rows in by_gpu1.items():
+        idx = gpu.split()[-1]
+        power_xticks.append(f"{gpu_type_n1}:{idx}")
+        power_vals.append(mean_safe(r["POWER"] for r in rows) or 0)
+        bar_colors.append("tab:orange")
+    if not power_vals:
+        # fallback (single-GPU 환경 호환)
+        power_xticks = [f"{gpu_type_n0}:0", f"{gpu_type_n1}:0"]
+        power_vals = [avg_power_n0 or 0, avg_power_n1 or 0]
+        bar_colors = ["tab:blue", "tab:orange"]
+
+    bars3 = axes[2].bar(power_xticks, power_vals, color=bar_colors, width=0.7)
     axes[2].set_ylabel("avg power [W]")
-    axes[2].set_title("Average GPU power")
+    axes[2].set_title("Average GPU power (per-GPU)")
     for b, v in zip(bars3, power_vals):
-        axes[2].text(b.get_x() + b.get_width() / 2, v, f"{v:.1f} W",
-                     ha="center", va="bottom", fontsize=9)
-    # TDP — L4 datacenter spec 72W, A10G (AWS 변종, 일반 A10 의 300W 버전) 300W.
-    L4_TDP_W = 72
-    A10G_TDP_W = 300
-    axes[2].axhline(L4_TDP_W, ls=":", color="tab:blue", alpha=0.4, linewidth=0.8)
-    axes[2].axhline(A10G_TDP_W, ls=":", color="tab:orange", alpha=0.4, linewidth=0.8)
-    axes[2].set_ylim(0, max(A10G_TDP_W, max(power_vals)) * 1.15)
+        axes[2].text(b.get_x() + b.get_width() / 2, v, f"{v:.0f}",
+                     ha="center", va="bottom", fontsize=8)
+    # TDP — meta 의 GPU type 별 NVIDIA datasheet TDP. axhline 으로 시각적 reference.
+    tdp_n0 = gpu_spec(gpu_type_n0, "tdp_w", 0)
+    tdp_n1 = gpu_spec(gpu_type_n1, "tdp_w", 0)
+    if tdp_n0:
+        axes[2].axhline(tdp_n0, ls=":", color="tab:blue", alpha=0.4, linewidth=0.8)
+    if tdp_n1:
+        axes[2].axhline(tdp_n1, ls=":", color="tab:orange", alpha=0.4, linewidth=0.8)
+    axes[2].set_ylim(0, max(max(tdp_n0, tdp_n1, 1), max(power_vals)) * 1.15)
+    axes[2].tick_params(axis="x", rotation=30, labelsize=8)
     power_legend_handles = [
-        plt.Line2D([0], [0], color="tab:blue", lw=8, label=f"L4 (TDP {L4_TDP_W}W)"),
-        plt.Line2D([0], [0], color="tab:orange", lw=8, label=f"A10G (TDP {A10G_TDP_W}W)"),
+        plt.Line2D([0], [0], color="tab:blue", lw=8, label=f"{gpu_type_n0} (TDP {tdp_n0}W)"),
+        plt.Line2D([0], [0], color="tab:orange", lw=8, label=f"{gpu_type_n1} (TDP {tdp_n1}W)"),
     ]
     axes[2].legend(handles=power_legend_handles, loc="upper left", fontsize=8)
 
@@ -613,16 +977,23 @@ def plot_bars(meta: dict, step_boundaries, dcgm0, dcgm1, flops_log: dict, out_pa
     return {
         "throughput_tokens_per_sec": throughput_tps,
         "pp_partition": pp_partition,
+        "tp": tp,
+        "gpu_type_node0": gpu_type_n0,
+        "gpu_type_node1": gpu_type_n1,
         "flops_per_stage_TF_per_step": [f / 1e12 for f in flops_per_stage],
+        "cluster_peak_tflops": cluster_peak_tflops,
         "achieved_tflops_cluster": cluster_achieved_tflops,
-        "achieved_tflops_l4": achieved_l4_tflops,
-        "achieved_tflops_a10g": achieved_a10g_tflops,
+        "achieved_tflops_node0_stage": achieved_n0_stage_tflops,     # sum across TP GPUs
+        "achieved_tflops_node1_stage": achieved_n1_stage_tflops,
+        "achieved_tflops_node0_per_gpu": achieved_n0_per_gpu,
+        "achieved_tflops_node1_per_gpu": achieved_n1_per_gpu,
         "mfu_cluster_pct": mfu_cluster * 100,
-        "mfu_l4_pct": mfu_l4 * 100,
-        "mfu_a10g_pct": mfu_a10g * 100,
-        "avg_power_l4_w": avg_power_l4,
-        "avg_power_a10g_w": avg_power_a10g,
+        "mfu_node0_pct": mfu_n0 * 100,                               # per-GPU
+        "mfu_node1_pct": mfu_n1 * 100,                               # per-GPU
+        "avg_power_node0_w": avg_power_n0,
+        "avg_power_node1_w": avg_power_n1,
         "steady_step_sec": steady_total,
+        "avg_latency_per_step_sec": steady_total,
         "steady_fwdbwd_sec": steady_fwdbwd,
     }
 
@@ -652,8 +1023,12 @@ def first_principles(meta: dict, steady_step_sec: float) -> dict:
     # 전체 학습 FLOPs ≈ 6 N × token (forward+backward 합산, attn 무시).
     flops_total = 6 * LLAMA32_1B_PARAMS * tokens_per_step
     flops_per_stage = flops_total / 2
-    compute_l4 = flops_per_stage / (L4_BF16_TFLOPS * 1e12)
-    compute_a10g = flops_per_stage / (A10G_BF16_TFLOPS * 1e12)
+    gpu_type_n0 = parse_gpu_type(meta, 0)
+    gpu_type_n1 = parse_gpu_type(meta, 1)
+    sustained_n0 = gpu_spec(gpu_type_n0, "sustained_bf16_tflops", 1)
+    sustained_n1 = gpu_spec(gpu_type_n1, "sustained_bf16_tflops", 1)
+    compute_n0 = flops_per_stage / (sustained_n0 * 1e12)
+    compute_n1 = flops_per_stage / (sustained_n1 * 1e12)
 
     # 이론 comm time — burst 와 baseline 두 가지 모두 (5분 짧은 benchmark 에서는
     # burst 가 가능하지만, 시간 단위 학습에서는 baseline 156 MB/s 에 묶임).
@@ -666,11 +1041,13 @@ def first_principles(meta: dict, steady_step_sec: float) -> dict:
         "measured_step_sec": round(steady_step_sec, 3) if steady_step_sec else None,
         "measured_throughput_tokens_per_sec": round(measured_tps, 1) if measured_tps else None,
         "measured_avg_nic_bytes_per_step_MBps": round(measured_avg_nic_MBps, 1) if measured_avg_nic_MBps else None,
-        "theoretical_compute_per_stage_sec_l4": round(compute_l4, 2),
-        "theoretical_compute_per_stage_sec_a10g": round(compute_a10g, 2),
+        "gpu_type_node0": gpu_type_n0,
+        "gpu_type_node1": gpu_type_n1,
+        "theoretical_compute_per_stage_sec_node0": round(compute_n0, 2),
+        "theoretical_compute_per_stage_sec_node1": round(compute_n1, 2),
         "theoretical_comm_at_ena_burst_sec": round(comm_at_burst, 2),
         "theoretical_comm_at_ena_baseline_sec": round(comm_at_baseline, 2),
-        "implied_idle_sec": round(steady_step_sec - max(compute_l4, compute_a10g) - comm_at_burst, 2)
+        "implied_idle_sec": round(steady_step_sec - max(compute_n0, compute_n1) - comm_at_burst, 2)
             if steady_step_sec else None,
     }
 
@@ -708,12 +1085,14 @@ def write_stats(meta: dict, dcgm0, dcgm1, nic0_rate, nic1_rate, step_boundaries,
         steady_optim = mean_safe(optimizer_times[STEADY_SLICE]) if len(optimizer_times) > 1 else None
         lines.append(f"- step 1 (warmup) total: {warmup_total:.2f} s")
         if steady_total is not None:
-            lines.append(f"- steady-state (step 2..{len(step_total_times)}) **total** 평균: "
+            lines.append(f"- steady-state (step 2..{len(step_total_times)}) **avg latency per step**: "
                          f"**{steady_total:.2f} s** (fwd/bwd {steady_fwdbwd:.2f}s + "
                          f"optimizer/tied {steady_optim:.2f}s)\n")
 
+    gpu_type_n0 = parse_gpu_type(meta, 0)
+    gpu_type_n1 = parse_gpu_type(meta, 1)
     lines.append("\n## DCGM 평균 (학습 active 구간만)\n")
-    lines.append("| 지표 | NODE 0 (L4) | NODE 1 (A10G) |")
+    lines.append(f"| 지표 | NODE 0 ({gpu_type_n0}) | NODE 1 ({gpu_type_n1}) |")
     lines.append("|---|---:|---:|")
     if n0_active and n1_active:
         rows = [
@@ -760,11 +1139,13 @@ def write_stats(meta: dict, dcgm0, dcgm1, nic0_rate, nic1_rate, step_boundaries,
                  f"baseline {ENA_BASELINE_GBPS} Gbps (sustained) 면 "
                  f"`{fp['theoretical_comm_at_ena_baseline_sec']} s`. EFA 미지원 인스턴스라 "
                  f"NCCL Socket plugin (TCP) fallback.")
+    sustained_n0 = gpu_spec(gpu_type_n0, "sustained_bf16_tflops", 0)
+    sustained_n1 = gpu_spec(gpu_type_n1, "sustained_bf16_tflops", 0)
     lines.append(f"- 이론 compute (per stage, 6N × tokens / sustained TFLOPs 추정): "
-                 f"L4 측 `{fp['theoretical_compute_per_stage_sec_l4']} s` "
-                 f"({L4_BF16_TFLOPS} TFLOPs 기준), A10G 측 "
-                 f"`{fp['theoretical_compute_per_stage_sec_a10g']} s` "
-                 f"({A10G_BF16_TFLOPS} TFLOPs 기준).")
+                 f"{gpu_type_n0} 측 `{fp['theoretical_compute_per_stage_sec_node0']} s` "
+                 f"({sustained_n0} TFLOPs 기준), {gpu_type_n1} 측 "
+                 f"`{fp['theoretical_compute_per_stage_sec_node1']} s` "
+                 f"({sustained_n1} TFLOPs 기준).")
     lines.append(f"- 측정 steady step: `{fp['measured_step_sec']} s` → throughput "
                  f"`{fp['measured_throughput_tokens_per_sec']} tokens/s`.")
     if fp['measured_avg_nic_bytes_per_step_MBps']:
@@ -840,6 +1221,7 @@ def main():
     print(f"[plot] data    → {data_dir}")
 
     # OOM / failed run: skip plot 생성, OOM 표기만 stats.md 에 남기고 종료.
+    # raw 는 디버깅 위해 항상 아카이브 (정상 run 과 동일 경로). archival 은 main 끝에서 일괄.
     oom = bool(meta.get("oom", False))
     completed_steps = int(meta.get("completed_steps", 0))
     if oom or completed_steps < 2:
@@ -857,6 +1239,17 @@ def main():
             "failed": True,
         }, indent=2))
         print(f"[plot] {descriptor}: skipped plotting ({reason})")
+        # Archive raw 디버깅 위해 항상 (정상 run 과 동일).
+        raw_root = Path("/home/ubuntu/nanotron/examples/heterogeneous/data/raw")
+        raw_dst = raw_root / cluster / model / descriptor
+        raw_dst.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for f in run_dir.iterdir():
+            if f.is_file():
+                dst = raw_dst / f.name
+                dst.write_bytes(f.read_bytes())
+                copied.append(f.name)
+        print(f"[plot] archived raw → {raw_dst} ({len(copied)} files, failed run)")
         return
 
     dcgm0 = dcgm_jsonl(run_dir / "dcgm_node0.txt", awk)
@@ -865,27 +1258,62 @@ def main():
     nic1 = parse_nic(run_dir / "nic_node1.txt")
     step_boundaries = extract_step_boundaries(run_dir / "train_node0.log")
 
-    plot_timeseries(meta, dcgm0, dcgm1, nic0, nic1, step_boundaries, fig_dir / "timeseries.png")
-    print(f"saved {fig_dir / 'timeseries.png'}")
+    # Per-GPU timeseries (4 L4 + 4 A10G subplots) — power, temp, SMACT, TENSO 분리.
+    plot_per_gpu_metric(meta, dcgm0, dcgm1, step_boundaries,
+                        "POWER", "GPU power [W]", "GPU power per GPU",
+                        fig_dir / "power_per_gpu.png")
+    plot_per_gpu_metric(meta, dcgm0, dcgm1, step_boundaries,
+                        "TMPTR", "GPU temp [°C]", "GPU temperature per GPU",
+                        fig_dir / "temp_per_gpu.png")
+    plot_per_gpu_metric(meta, dcgm0, dcgm1, step_boundaries,
+                        "SMACT", "SMACT (0..1)", "SM active fraction per GPU",
+                        fig_dir / "smact_per_gpu.png")
+    plot_per_gpu_metric(meta, dcgm0, dcgm1, step_boundaries,
+                        "TENSO", "TENSO (0..1)", "Tensor-core utilization per GPU",
+                        fig_dir / "tenso_per_gpu.png")
+    # Node-level bandwidth (NIC, PCIe sum, DRAM mean) — per-GPU 대신 node 합/평균.
+    plot_node_bandwidth(meta, dcgm0, dcgm1, nic0, nic1, step_boundaries,
+                        fig_dir / "node_bandwidth.png")
+    print(f"saved per-GPU metrics + node_bandwidth → {fig_dir}")
 
     flops_log = extract_flops_log(run_dir / "train_node0.log")
     if flops_log["per_module"]:
         print(f"loaded module FLOPs: {flops_log['per_module']}")
 
     # Per-rank memory peaks (nanotron의 log_memory + nvidia-smi 둘 다).
+    gpu_type_n0 = parse_gpu_type(meta, 0)
+    gpu_type_n1 = parse_gpu_type(meta, 1)
     memory_peaks = {
-        "node0_l4": extract_memory_peaks(run_dir / "train_node0.log"),
-        "node1_a10g": extract_memory_peaks(run_dir / "train_node1.log"),
+        "node0": extract_memory_peaks(run_dir / "train_node0.log"),
+        "node1": extract_memory_peaks(run_dir / "train_node1.log"),
     }
-    # nvidia-smi 의 max memory.used (sustained 값, PyTorch caching allocator 외부 시각).
-    memory_peaks["nvidia_smi_max_MiB_node0"] = meta.get("nvidia_smi_max_used_MiB_node0", 0)
-    memory_peaks["nvidia_smi_max_MiB_node1"] = meta.get("nvidia_smi_max_used_MiB_node1", 0)
-    if memory_peaks["node0_l4"]:
-        print(f"L4   peak reserved (PyTorch): {memory_peaks['node0_l4'].get('max_reserved_MiB', 0):.0f} MiB | "
-              f"nvidia-smi max: {memory_peaks['nvidia_smi_max_MiB_node0']} MiB")
-    if memory_peaks["node1_a10g"]:
-        print(f"A10G peak reserved (PyTorch): {memory_peaks['node1_a10g'].get('max_reserved_MiB', 0):.0f} MiB | "
-              f"nvidia-smi max: {memory_peaks['nvidia_smi_max_MiB_node1']} MiB")
+    # Per-GPU nvidia-smi (comma-separated samples per node, TP=N 환경에서 N GPU).
+    nvsmi_n0 = parse_nvidia_smi_per_gpu(run_dir / "nvidia_smi_node0.txt")
+    nvsmi_n1 = parse_nvidia_smi_per_gpu(run_dir / "nvidia_smi_node1.txt")
+    memory_peaks["nvidia_smi_per_gpu_node0"] = per_gpu_max_nvsmi(nvsmi_n0)
+    memory_peaks["nvidia_smi_per_gpu_node1"] = per_gpu_max_nvsmi(nvsmi_n1)
+    # node 전체의 max (TP=N GPU 중 어느 하나라도 가장 높았던 값) — OOM threshold 용도.
+    memory_peaks["nvidia_smi_max_MiB_node0"] = (
+        max(memory_peaks["nvidia_smi_per_gpu_node0"], default=0)
+        or meta.get("nvidia_smi_max_used_MiB_node0", 0))
+    memory_peaks["nvidia_smi_max_MiB_node1"] = (
+        max(memory_peaks["nvidia_smi_per_gpu_node1"], default=0)
+        or meta.get("nvidia_smi_max_used_MiB_node1", 0))
+    if memory_peaks["node0"]:
+        print(f"{gpu_type_n0:5s} peak reserved (PyTorch, per-rank max): {memory_peaks['node0'].get('max_reserved_MiB', 0):.0f} MiB | "
+              f"nvidia-smi per-GPU max: {memory_peaks['nvidia_smi_per_gpu_node0']}")
+    if memory_peaks["node1"]:
+        print(f"{gpu_type_n1:5s} peak reserved (PyTorch, per-rank max): {memory_peaks['node1'].get('max_reserved_MiB', 0):.0f} MiB | "
+              f"nvidia-smi per-GPU max: {memory_peaks['nvidia_smi_per_gpu_node1']}")
+
+    # Per-GPU DCGM 통계 — bar_summary 의 node-level 평균과 별도로 GPU 별 분포
+    # (avg/max power, temp, SMACT/TENSO/DRAMA) 보존. steady-state 동일 window 사용.
+    n0_active = active_window(dcgm0)
+    n1_active = active_window(dcgm1)
+    dcgm_per_gpu = {
+        "node0_active": aggregate_dcgm_per_gpu(n0_active),
+        "node1_active": aggregate_dcgm_per_gpu(n1_active),
+    }
 
     bar_summary = plot_bars(meta, step_boundaries, dcgm0, dcgm1, flops_log, fig_dir / "bars.png")
     print(f"saved {fig_dir / 'bars.png'}")
@@ -907,9 +1335,26 @@ def main():
         "bar_summary": bar_summary,
         "flops_log": flops_log,
         "memory_peaks": memory_peaks,
+        "dcgm_per_gpu": dcgm_per_gpu,
     }, indent=2))
     (data_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"saved {data_dir / 'stats.md'} and stats.json + meta.json")
+
+    # Archive raw: data/raw/<cluster>/<model>/<descriptor>/ (dev EBS 영속).
+    # /opt/dlami/nvme/runs/ 는 instance ephemeral 이라 stop 시 삭제 — 영속 archive 필요.
+    cluster = meta.get("cluster", "unknown_cluster")
+    model = meta.get("model", "unknown_model")
+    descriptor = meta.get("descriptor", run_dir.name)
+    raw_root = Path("/home/ubuntu/nanotron/examples/heterogeneous/data/raw")
+    raw_dst = raw_root / cluster / model / descriptor
+    raw_dst.mkdir(parents=True, exist_ok=True)
+    import shutil
+    copied = []
+    for f in run_dir.iterdir():
+        if f.is_file():
+            shutil.copy2(f, raw_dst / f.name)
+            copied.append(f.name)
+    print(f"archived raw → {raw_dst} ({len(copied)} files)")
 
 
 if __name__ == "__main__":

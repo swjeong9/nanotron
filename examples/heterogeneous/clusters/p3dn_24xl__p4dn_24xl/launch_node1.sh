@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# NODE 1 (p4dn.24xlarge, 8× A100 40GB SXM4 — NVSwitch intra-node).
+# 기본 PP=2 TP=8 의 stage 1. rdzv_endpoint = NODE 0. NODE 0 :29500 열린 뒤 launch.
+#
+# Usage:
+#   RDZV_HOST=<NODE0_IP> bash launch_node1.sh [config_path]
+
+set -euo pipefail
+cd "$(dirname "$0")/../../../.."
+
+CONFIG="${1:-examples/heterogeneous/configs/qwen3_14b/alpaca_pp2_tp8_fp16.yaml}"
+RDZV_HOST="${RDZV_HOST:?RDZV_HOST must be set to NODE 0 IP}"
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG=INFO
+# EFA 비활성화 — 위 launch_node0.sh comment 참조 (cross-instance OFI RC: 265 hang 회피).
+export NCCL_IB_DISABLE=1
+export NCCL_NET_PLUGIN=none
+export FI_PROVIDER='^efa'
+# p4dn default route NIC — 일반적으로 ``ens32`` (p4d 와 동일 family) 인데, 인스턴스 launch 후
+# `ip route get 1 | awk '{print $5}'` 로 확인 후 override.
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens32}"
+export OMP_NUM_THREADS=4
+export PATH="$HOME/.local/bin:$PATH"
+
+uv run torchrun \
+  --nproc_per_node=8 \
+  --nnodes=2 \
+  --node_rank=1 \
+  --rdzv_backend=static \
+  --master_addr=${RDZV_HOST} \
+  --master_port=29500 \
+  --max_restarts=0 \
+  run_train.py \
+  --config-file "$CONFIG" \
+  2>&1 | tee /opt/dlami/nvme/torchrun_node1.log

@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from flash_attn.modules.mha import flash_attn_varlen_kvpacked_func
 from torch import nn
-from torch.utils.checkpoint import CheckpointFunction
+from torch.utils.checkpoint import checkpoint
 
 from nanotron import distributed as dist
 from nanotron import logging
@@ -48,7 +48,8 @@ class CoreAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        # Qwen 3 가 head_dim 명시 (e.g. 1024/16=64 ≠ 128 인 0.6B). __post_init__ 에서 default 채워둠.
+        self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.local_num_heads = self.num_heads // tp_pg.size()
@@ -157,8 +158,8 @@ class Qwen2Attention(LogMixin, nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.local_num_kv_heads = self.num_kv_heads // self.tp_pg_size
 
-        # Dimensions
-        self.head_dim = config.hidden_size // self.num_heads
+        # Dimensions — head_dim 은 config 에서 직접 읽음 (Qwen 3 비대칭 케이스 지원).
+        self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.local_q_size = self.local_num_heads * self.head_dim
@@ -216,6 +217,16 @@ class Qwen2Attention(LogMixin, nn.Module):
         self.sliding_window_size = config.sliding_window_size
         self.log_attn_probs = config.log_attn_probs
         self.heads_k_stride = config.ring_attn_heads_k_stride
+
+        # Qwen 3: q_norm/k_norm (RMSNorm over head_dim) applied between projection and RoPE.
+        # Qwen 2 / Llama: 사용 안 함. weight 자체가 없는 게 의미 있어 None 으로 둠 (state_dict 에 안 잡힘).
+        if config._use_qk_norm:
+            norm_class = TritonRMSNorm if config._fused_rms_norm else RMSNorm
+            self.q_norm = norm_class(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = norm_class(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
         # TODO: support SFT
 
     def forward(
@@ -269,6 +280,16 @@ class Qwen2Attention(LogMixin, nn.Module):
         kv = qkv[..., self.local_num_heads * self.head_dim :]  # Not contiguous, similar to flash_attn
         q = q.view(-1, seq_length, self.local_num_heads, self.head_dim)
         kv = kv.view(-1, seq_length, 2, self.local_num_kv_heads, self.head_dim)
+
+        # Qwen 3 q/k norm: HF 기준 q_proj 출력 view 직후, RoPE 직전에 적용 (head_dim 마지막 축).
+        # k 만 norm 하고 v 는 그대로 두려면 kv 텐서를 split→norm→stack 한다 (in-place 쓰면 autograd 위험).
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k_unnormed = kv[:, :, 0]  # [b, s, kvh, d]
+            v = kv[:, :, 1]           # [b, s, kvh, d]
+            k = self.k_norm(k_unnormed)
+            kv = torch.stack([k, v], dim=2)  # [b, s, 2, kvh, d]
+
         if self.config.no_rope_layer is None or (self.layer_idx + 1) % self.config.no_rope_layer != 0:
             seqlen_offset = dist.get_rank(self.cp_pg) * seq_length
             q, kv = self.rotary_emb(
@@ -302,6 +323,26 @@ class Qwen2Attention(LogMixin, nn.Module):
                 return_attn_probs=self.log_attn_probs,
                 group=self.cp_pg,
             )  # Not contiguous, similar to flash_attn
+        elif self.config._attn_implementation == "xformers":
+            # V100 (Volta) 호환 — FlashAttention 미지원 (Ampere+ 만). xformers Cutlass 백엔드는 SM_70+ OK.
+            # BlockDiagonalCausalMask 가 cu_seqlens 으로부터 varlen mask 빌드 (mask materialize 없이 효율적).
+            from xformers.ops import memory_efficient_attention
+            from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
+            assert cu_seqlens.dtype == torch.int32
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            attn_bias = BlockDiagonalCausalMask.from_seqlens(seqlens)
+            # xformers 입력 형태: [B=1, M, H, K] (varlen 시 batch 1 로 packed).
+            q_xf = q.unsqueeze(0)             # [1, T, H, D]
+            k_xf = kv[:, 0].unsqueeze(0)      # [1, T, H_kv, D]
+            v_xf = kv[:, 1].unsqueeze(0)      # [1, T, H_kv, D]
+            # GQA: xformers 가 H != H_kv 자동 처리 안 하면 repeat_interleave.
+            if self.local_num_kv_heads != self.local_num_heads:
+                repeats = self.local_num_heads // self.local_num_kv_heads
+                k_xf = k_xf.repeat_interleave(repeats, dim=2)
+                v_xf = v_xf.repeat_interleave(repeats, dim=2)
+            attn_output = memory_efficient_attention(q_xf, k_xf, v_xf, attn_bias=attn_bias)
+            # [1, T, H, D] → [T, H, D]
+            attn_output = attn_output.squeeze(0).contiguous()
         else:
             assert cu_seqlens.dtype == torch.int32
             assert max_seqlen is not None
@@ -553,8 +594,13 @@ class Qwen2MoELayer(nn.Module):
         return output
 
     def _checkpointed_forward(self, hidden_states):
-        """Apply gradient checkpointing to save memory during training."""
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states)
+        """Apply gradient checkpointing to save memory during training.
+
+        ``use_reentrant=False`` 사용 — reentrant API (CheckpointFunction.apply) 가 multi-output
+        case 에서 활성화를 해제 못 하는 known issue 회피 (nvtop 에서 stair-step memory growth
+        관찰됨, 2026-04 nanotron 검증). 비-reentrant 는 PyTorch 의 권장 default.
+        """
+        return checkpoint(self._core_forward, hidden_states, use_reentrant=False)
 
     def forward(self, hidden_states):
         """Forward pass for the MoE layer."""
@@ -637,7 +683,16 @@ class Qwen2DecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states, position_ids, cu_seqlens)
+        # `_core_forward` 가 (hidden_states, position_ids, cu_seqlens) 3 tuple 을 반환하지만
+        # position_ids/cu_seqlens 는 input 그대로 passthrough → checkpoint 가 이걸 saved-for-backward
+        # 로 잡고 매 microbatch 마다 해제 못 함 (stair-step memory growth, 2026-04 검증).
+        # Workaround: hidden_states 만 checkpoint, 나머지는 외부에서 그대로 전달.
+        def _hidden_only(h):
+            out_h, _, _ = self._core_forward(h, position_ids, cu_seqlens)
+            return out_h
+
+        new_hidden = checkpoint(_hidden_only, hidden_states, use_reentrant=False)
+        return new_hidden, position_ids, cu_seqlens
 
     def forward(
         self,
@@ -832,7 +887,8 @@ class Qwen2Model(nn.Module):
         """Computes the compute cost of each block in the model for load balancing."""
         model_config = self.config
         d_ff = model_config.intermediate_size
-        d_qkv = model_config.hidden_size // model_config.num_attention_heads
+        # head_dim 은 config 우선 (Qwen 3: hidden_size/num_heads 와 다를 수 있음).
+        d_qkv = model_config.head_dim
         block_compute_costs = {
             # Self-attention (qkv proj + attn out) + MLP
             Qwen2DecoderLayer: 4 * model_config.num_attention_heads * d_qkv * model_config.hidden_size

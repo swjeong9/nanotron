@@ -218,6 +218,9 @@ ALL_ATTENTION_FUNCTIONS = {
     "ring_flash_triton": lambda *args, **kwargs: get_ring_flash_attn_cuda()(*args, **kwargs),
     "ring": ring_flash_attn_varlen_func,
     "llama3_ring_attention": llama3_flash_attn_varlen_qkvpacked_func,
+    # "xformers" 는 qwen.py 의 _forward_packed 에서 직접 처리 (CoreAttention dispatch 거치지 않음).
+    # config validation 통과용 stub.
+    "xformers": None,
 }
 
 AttentionImplementation = Literal[tuple(ALL_ATTENTION_FUNCTIONS.keys())]

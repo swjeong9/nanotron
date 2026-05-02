@@ -131,6 +131,7 @@ class Qwen2Config:
     num_attention_heads: int = 32
     num_hidden_layers: int = 32
     num_key_value_heads: Optional[int] = None
+    head_dim: Optional[int] = None  # If None, falls back to hidden_size // num_attention_heads. Qwen 3 specifies explicitly (e.g. Qwen3-0.6B: hidden=1024 num_heads=16 head_dim=128 → q_proj is asymmetric).
     pad_token_id: Optional[int] = None
     pretraining_tp: int = 1
     rms_norm_eps: float = 1e-6
@@ -144,6 +145,7 @@ class Qwen2Config:
     _attn_implementation: Optional[AttentionImplementation] = DEFAULT_ATTENTION_IMPLEMENTATION
     flex_attention_mask: Optional[str] = None
     attention_bias: bool = False
+    _use_qk_norm: bool = False  # Qwen 3 only: RMSNorm on q & k (over head_dim), applied after q/k proj and before RoPE.
     sliding_window_size: Optional[int] = None
     z_loss_enabled: bool = False  # Z-loss regularization https://www.jmlr.org/papers/volume24/22-1144/22-1144.pdf
     z_loss_coefficient: float = 0.0001  # Default from the paper (10^-4)
@@ -170,6 +172,11 @@ class Qwen2Config:
         # for backward compatibility
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+
+        # Qwen 3: head_dim 가 hidden_size/num_attention_heads 와 다를 수 있음 (e.g. 0.6B/4B/32B).
+        # 명시 안 하면 Llama/Qwen2 의 기본 추론을 그대로 사용.
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
 
         # By default i want all layers to be MoE layers
         if self.moe_config and self.moe_config.layers == [-1]:

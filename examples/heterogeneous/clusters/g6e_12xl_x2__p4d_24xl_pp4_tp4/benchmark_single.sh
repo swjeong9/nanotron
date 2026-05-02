@@ -1,46 +1,52 @@
 #!/usr/bin/env bash
-# Production-like 학습 한 번 measurement (g6.12xl + g5.12xl, PP=2 TP=4).
-#
-# 양 노드 (worker 0 = g6.12xl, worker 1 = g5.12xl) 에 ssh launch + dev 에서
-# 결과 수집. dev 노드는 worker 가 아니므로 GPU 없어도 됨.
+# 3-node benchmark single run (2× g6e.12xl + 1× p4d.24xl, PP=4 TP=4).
 #
 # Usage:
 #   bash benchmark_single.sh                                 # default config + 균등 partition
-#   bash benchmark_single.sh <config_path> <partition>       # e.g. ../configs/llama32_3b/alpaca_pp2_tp4.yaml 12-16
+#   bash benchmark_single.sh <config_path> <partition>       # e.g. ../configs/qwen3_14b/alpaca_pp4_tp4.yaml 8-11-11-10
 
 set -uo pipefail   # -e 빼고 (한 partition fail 해도 sweep 이어가도록)
 
 NANOTRON=/home/ubuntu/nanotron
 CLUSTER_DIR="$(cd "$(dirname "$0")" && pwd)"
 NODES_JSON="$NANOTRON/examples/heterogeneous/nodes.json"
-DEFAULT_CONFIG="examples/heterogeneous/configs/llama32_3b/alpaca_pp2_tp4.yaml"
+DEFAULT_CONFIG="examples/heterogeneous/configs/qwen3_14b/alpaca_pp4_tp4.yaml"
 
 CONFIG_REL="${1:-$DEFAULT_CONFIG}"
 PARTITION_OVERRIDE="${2:-}"
 CONFIG="$NANOTRON/$CONFIG_REL"
 [ -f "$CONFIG" ] || { echo "Config not found: $CONFIG" >&2; exit 2; }
 
-# Worker IPs from nodes.json
+# Worker IPs from nodes.json (by node_rank).
 NODE0_IP=$(uv run --no-project python -c "
 import json
 nodes = json.load(open('$NODES_JSON'))['nodes']
-print(next(n['private_ip'] for n in nodes if n['instance_type'].startswith('g6.12x')))
+print(next(n['private_ip'] for n in nodes if n.get('node_rank') == 0))
 ")
 NODE1_IP=$(uv run --no-project python -c "
 import json
 nodes = json.load(open('$NODES_JSON'))['nodes']
-print(next(n['private_ip'] for n in nodes if n['instance_type'].startswith('g5.12x')))
+print(next(n['private_ip'] for n in nodes if n.get('node_rank') == 1))
 ")
+NODE2_IP=$(uv run --no-project python -c "
+import json
+nodes = json.load(open('$NODES_JSON'))['nodes']
+print(next(n['private_ip'] for n in nodes if n.get('node_rank') == 2))
+")
+ALL_IPS=("$NODE0_IP" "$NODE1_IP" "$NODE2_IP")
+NPROC_PER_NODE=(4 4 8)
 
 # Sync 강제 — partition override 이전에 한 번
 bash "$CLUSTER_DIR/sync.sh"
 
-# config sed 강제 — mbs/ga/train_steps + partition override
+# config sed 강제 — production-like benchmark 의 invariants + partition override.
+# ga=16 : alpaca 662 packed bins (s=8192) ÷ (mbs=4 × ga=16) = 10.3 step → 5 step 안전 fit.
+# ga=64 면 256 bins/step × 5 = 1280 필요해 데이터 부족 (assertion fail).
 ORIGINAL_PARTITION_LINE=$(grep '^  pp_layer_partition:' "$CONFIG" || echo "")
-sed -i 's/^  micro_batch_size: .*/  micro_batch_size: 2/' "$CONFIG"
-sed -i 's/^  batch_accumulation_per_replica: .*/  batch_accumulation_per_replica: 64/' "$CONFIG"
-sed -i 's/^  train_steps: .*/  train_steps: 3/' "$CONFIG"
-sed -i 's/^  sequence_length: .*/  sequence_length: 1024/' "$CONFIG"
+sed -i 's/^  micro_batch_size: .*/  micro_batch_size: 4/' "$CONFIG"
+sed -i 's/^  batch_accumulation_per_replica: .*/  batch_accumulation_per_replica: 16/' "$CONFIG"
+sed -i 's/^  train_steps: .*/  train_steps: 5/' "$CONFIG"
+sed -i 's/^  sequence_length: .*/  sequence_length: 8192/' "$CONFIG"
 sed -i 's/^      dataset_overwrite_cache: .*/      dataset_overwrite_cache: false/' "$CONFIG"
 
 if [ -n "$PARTITION_OVERRIDE" ]; then
@@ -49,11 +55,11 @@ if [ -n "$PARTITION_OVERRIDE" ]; then
 fi
 
 # 변경된 config 양 노드 재 sync + verify
-for ip in "$NODE0_IP" "$NODE1_IP"; do
+for ip in "${ALL_IPS[@]}"; do
     rsync -aq "$CONFIG" "ubuntu@$ip:$CONFIG"
 done
 LOCAL_CFG_MD5=$(md5sum "$CONFIG" | awk '{print $1}')
-for ip in "$NODE0_IP" "$NODE1_IP"; do
+for ip in "${ALL_IPS[@]}"; do
     REMOTE_CFG_MD5=$(ssh -o BatchMode=yes "ubuntu@$ip" "md5sum $CONFIG" 2>/dev/null | awk '{print $1}')
     if [ "$LOCAL_CFG_MD5" != "$REMOTE_CFG_MD5" ]; then
         echo "[benchmark] ✗ config md5 mismatch on $ip; aborting" >&2
@@ -76,7 +82,7 @@ RECOMPUTE_TAG=""
 DESCRIPTOR="mbs${MBS}_ga${GA}_seq${SEQ}_tp4${RECOMPUTE_TAG}_split${PARTITION}"
 
 MODEL=$(basename "$(dirname "$CONFIG")")
-CLUSTER="g6_12xl__g5_12xl_pp2_tp4"
+CLUSTER="g6e_12xl_x2__p4d_24xl_pp4_tp4"
 
 OUT_DIR="/opt/dlami/nvme/runs/$CLUSTER/$MODEL/$DESCRIPTOR"
 echo "[benchmark] cluster=$CLUSTER model=$MODEL descriptor=$DESCRIPTOR"
@@ -87,24 +93,25 @@ FIELDS="155,156,150,100,101,203,204,1001,1002,1003,1004,1005,1007,1008,1009,1010
 mkdir -p "$OUT_DIR"
 rm -rf "$OUT_DIR"/*
 
-# 1) cleanup 양 노드
-for ip in "$NODE0_IP" "$NODE1_IP"; do
+# 1) cleanup 모든 노드
+for ip in "${ALL_IPS[@]}"; do
     ssh -o BatchMode=yes "ubuntu@$ip" \
         "pkill -9 -f run_train; pkill -9 -f torchrun; pkill -f 'dcgmi dmon'; pkill -f 'while :'" 2>/dev/null || true
 done
 sleep 2
 
-# 2) DCGM dmon 양 노드 background. 4 GPU 라 모든 GPU 데이터 capture.
-DCGM_START_TS_NODE0=$(ssh -o BatchMode=yes "ubuntu@$NODE0_IP" \
-    "ts=\$(date +%s.%N); nohup dcgmi dmon -e \"$FIELDS\" -d 1000 \
-     > /opt/dlami/nvme/dcgm_node0.txt 2>&1 & echo \$ts" 2>/dev/null || echo "0")
-DCGM_START_TS_NODE1=$(ssh -o BatchMode=yes "ubuntu@$NODE1_IP" \
-    "ts=\$(date +%s.%N); nohup dcgmi dmon -e \"$FIELDS\" -d 1000 \
-     > /opt/dlami/nvme/dcgm_node1.txt 2>&1 & echo \$ts" 2>/dev/null || echo "0")
+# 2) DCGM dmon 모든 노드 background.
+declare -a DCGM_START_TS
+for i in 0 1 2; do
+    ip="${ALL_IPS[$i]}"
+    DCGM_START_TS[$i]=$(ssh -o BatchMode=yes "ubuntu@$ip" \
+        "ts=\$(date +%s.%N); nohup dcgmi dmon -e \"$FIELDS\" -d 1000 \
+         > /opt/dlami/nvme/dcgm_node${i}.txt 2>&1 & echo \$ts" 2>/dev/null || echo "0")
+done
 
-# 3) NIC + nvidia-smi sampler 양 노드 background.
-# NIC interface 자동 감지 — primary route 의 dev.
-for ip in "$NODE0_IP" "$NODE1_IP"; do
+# 3) NIC + nvidia-smi sampler 모든 노드 background.
+for i in 0 1 2; do
+    ip="${ALL_IPS[$i]}"
     ssh -o BatchMode=yes "ubuntu@$ip" "
         IFACE=\$(ip route get 1 | awk '{print \$5; exit}')
         nohup bash -c \"
@@ -114,7 +121,7 @@ for ip in "$NODE0_IP" "$NODE1_IP"; do
             echo \\\"\\\$ts \\\$line\\\"
             sleep 0.1
         done
-        \" > /opt/dlami/nvme/nic_${ip##*.}.txt 2>&1 &
+        \" > /opt/dlami/nvme/nic_node${i}.txt 2>&1 &
 
         nohup bash -c '
         while :; do
@@ -123,13 +130,13 @@ for ip in "$NODE0_IP" "$NODE1_IP"; do
             echo \"\$ts \$used\"
             sleep 1
         done
-        ' > /opt/dlami/nvme/nvidia_smi_${ip##*.}.txt 2>&1 &
+        ' > /opt/dlami/nvme/nvidia_smi_node${i}.txt 2>&1 &
     " || true
 done
 
 sleep 1
 
-# 4) 학습 시작 — NODE 0 master, NODE 1 worker
+# 4) 학습 시작 — NODE 0 master, NODE 1 + NODE 2 worker
 START_TS=$(date -u +%s.%N)
 
 ssh -o BatchMode=yes "ubuntu@$NODE0_IP" "
@@ -138,95 +145,106 @@ ssh -o BatchMode=yes "ubuntu@$NODE0_IP" "
         > /opt/dlami/nvme/train_node0.log 2>&1 &
 " || true
 
-# NODE 0 의 :29500 가 열릴 때까지 대기 (NODE 1 launch 전)
+# NODE 0 의 :29500 가 열릴 때까지 대기 (다른 노드 launch 전)
 NODE0_READY_DEADLINE=$(($(date +%s) + 60))
 while ! ssh -o BatchMode=yes "ubuntu@$NODE0_IP" "ss -tnlp 2>/dev/null | grep -q ':29500 '" 2>/dev/null; do
     if [ $(date +%s) -ge $NODE0_READY_DEADLINE ]; then
-        echo "[benchmark] NODE 0 :29500 never opened; aborting"
+        # uv run 이 첫 실행 시 패키지 resync + torch import 로 60s 초과할 수 있음.
+        # rendezvous 는 worker launch 후에도 따라잡으므로 break 만 — script 는 abort X.
+        echo "[benchmark] :29500 wait timed out (60s) — continuing anyway, workers will block on rendezvous if master not up yet"
         break
     fi
     sleep 1
 done
 
-# NODE 1 launch (foreground for monitoring its exit)
-timeout 1800 ssh -o BatchMode=yes "ubuntu@$NODE1_IP" "
+# NODE 1 launch (background, 그 다음 NODE 2 도 background)
+ssh -o BatchMode=yes "ubuntu@$NODE1_IP" "
     cd $NANOTRON
-    RDZV_HOST=$NODE0_IP bash $CLUSTER_DIR/launch_node1.sh \"$CONFIG_REL\" \
-        > /opt/dlami/nvme/train_node1.log 2>&1
-" || NODE1_RC=$?
+    RDZV_HOST=$NODE0_IP nohup bash $CLUSTER_DIR/launch_node1.sh \"$CONFIG_REL\" \
+        > /opt/dlami/nvme/train_node1.log 2>&1 &
+" || true
 
-# NODE 1 끝났으면 NODE 0 도 곧 끝나야 함. 60s 대기 후 강제 kill.
-NODE0_DEADLINE=$(($(date +%s) + 60))
-while ssh -o BatchMode=yes "ubuntu@$NODE0_IP" "pgrep -f run_train > /dev/null" 2>/dev/null; do
-    if [ $(date +%s) -ge $NODE0_DEADLINE ]; then
-        ssh -o BatchMode=yes "ubuntu@$NODE0_IP" "pkill -9 -f run_train; pkill -9 -f torchrun" 2>/dev/null
-        NODE0_RC=124
-        break
-    fi
-    sleep 2
+# NODE 2 launch (foreground 으로 monitoring — 마지막 stage 라 죽으면 전체 abort)
+timeout 1800 ssh -o BatchMode=yes "ubuntu@$NODE2_IP" "
+    cd $NANOTRON
+    RDZV_HOST=$NODE0_IP bash $CLUSTER_DIR/launch_node2.sh \"$CONFIG_REL\" \
+        > /opt/dlami/nvme/train_node2.log 2>&1
+" || NODE2_RC=$?
+
+# NODE 2 끝났으면 NODE 0/1 도 곧 끝나야 함. 60s 대기 후 강제 kill.
+for ip in "$NODE0_IP" "$NODE1_IP"; do
+    DEADLINE=$(($(date +%s) + 60))
+    while ssh -o BatchMode=yes "ubuntu@$ip" "pgrep -f run_train > /dev/null" 2>/dev/null; do
+        if [ $(date +%s) -ge $DEADLINE ]; then
+            ssh -o BatchMode=yes "ubuntu@$ip" "pkill -9 -f run_train; pkill -9 -f torchrun" 2>/dev/null
+            break
+        fi
+        sleep 2
+    done
 done
 
-if [ "${NODE1_RC:-0}" -ne 0 ]; then
-    echo "[benchmark] ✗ NODE 1 exit rc=$NODE1_RC — killing NODE 0 immediately"
-    ssh -o BatchMode=yes "ubuntu@$NODE0_IP" "pkill -9 -f run_train; pkill -9 -f torchrun" 2>/dev/null
-    NODE0_RC=125
+if [ "${NODE2_RC:-0}" -ne 0 ]; then
+    echo "[benchmark] ✗ NODE 2 exit rc=$NODE2_RC — killing NODE 0/1 immediately"
+    for ip in "$NODE0_IP" "$NODE1_IP"; do
+        ssh -o BatchMode=yes "ubuntu@$ip" "pkill -9 -f run_train; pkill -9 -f torchrun" 2>/dev/null
+    done
 fi
 
 END_TS=$(date -u +%s.%N)
 
 # 5) 정리 — sampler 들 stop
-for ip in "$NODE0_IP" "$NODE1_IP"; do
+for ip in "${ALL_IPS[@]}"; do
     ssh -o BatchMode=yes "ubuntu@$ip" \
         "pkill -f 'dcgmi dmon'; pkill -f 'while :'" 2>/dev/null || true
 done
 sleep 1
 
-# 6) 결과 회수 — 양 노드 모두 dev 로 scp
-scp -q "ubuntu@$NODE0_IP:/opt/dlami/nvme/dcgm_node0.txt" "$OUT_DIR/dcgm_node0.txt" 2>/dev/null || true
-scp -q "ubuntu@$NODE1_IP:/opt/dlami/nvme/dcgm_node1.txt" "$OUT_DIR/dcgm_node1.txt" 2>/dev/null || true
-scp -q "ubuntu@$NODE0_IP:/opt/dlami/nvme/nic_${NODE0_IP##*.}.txt" "$OUT_DIR/nic_node0.txt" 2>/dev/null || true
-scp -q "ubuntu@$NODE1_IP:/opt/dlami/nvme/nic_${NODE1_IP##*.}.txt" "$OUT_DIR/nic_node1.txt" 2>/dev/null || true
-scp -q "ubuntu@$NODE0_IP:/opt/dlami/nvme/nvidia_smi_${NODE0_IP##*.}.txt" "$OUT_DIR/nvidia_smi_node0.txt" 2>/dev/null || true
-scp -q "ubuntu@$NODE1_IP:/opt/dlami/nvme/nvidia_smi_${NODE1_IP##*.}.txt" "$OUT_DIR/nvidia_smi_node1.txt" 2>/dev/null || true
-scp -q "ubuntu@$NODE0_IP:/opt/dlami/nvme/train_node0.log" "$OUT_DIR/train_node0.log" 2>/dev/null || true
-scp -q "ubuntu@$NODE1_IP:/opt/dlami/nvme/train_node1.log" "$OUT_DIR/train_node1.log" 2>/dev/null || true
+# 6) 결과 회수 — 모든 노드 dev 로 scp
+for i in 0 1 2; do
+    ip="${ALL_IPS[$i]}"
+    scp -q "ubuntu@$ip:/opt/dlami/nvme/dcgm_node${i}.txt"        "$OUT_DIR/dcgm_node${i}.txt" 2>/dev/null || true
+    scp -q "ubuntu@$ip:/opt/dlami/nvme/nic_node${i}.txt"         "$OUT_DIR/nic_node${i}.txt" 2>/dev/null || true
+    scp -q "ubuntu@$ip:/opt/dlami/nvme/nvidia_smi_node${i}.txt"  "$OUT_DIR/nvidia_smi_node${i}.txt" 2>/dev/null || true
+    scp -q "ubuntu@$ip:/opt/dlami/nvme/train_node${i}.log"       "$OUT_DIR/train_node${i}.log" 2>/dev/null || true
+done
 
-# 7) OOM detection
+# 7) OOM detection (모든 노드 log 검사)
 OOM=false
 if grep -q -E "CUDA out of memory|OutOfMemoryError" \
-    "$OUT_DIR/train_node0.log" "$OUT_DIR/train_node1.log" 2>/dev/null; then
+    "$OUT_DIR/train_node0.log" "$OUT_DIR/train_node1.log" "$OUT_DIR/train_node2.log" 2>/dev/null; then
     OOM=true
 fi
+
 # NODE 0 의 4 ranks (TP=4) 모두 같은 step 마다 "After training_step" 출력 →
 # raw count 가 nproc_per_node 배 부풀려짐. 4 로 나눠 실제 step 수 산출.
 COMPLETED_STEPS_RAW=$(grep -c "After training_step" "$OUT_DIR/train_node0.log" 2>/dev/null || true)
 COMPLETED_STEPS_RAW=${COMPLETED_STEPS_RAW:-0}
-NPROC_PER_NODE=4
-COMPLETED_STEPS=$((COMPLETED_STEPS_RAW / NPROC_PER_NODE))
+COMPLETED_STEPS=$((COMPLETED_STEPS_RAW / 4))
 
-# 8) max nvidia-smi memory (양 노드 4 GPU 의 max)
-NVSMI_MAX_NODE0=$(awk '{for(i=2;i<=NF;i++) if($i+0>m) m=$i+0} END{print m+0}' \
-    "$OUT_DIR/nvidia_smi_node0.txt" 2>/dev/null || echo 0)
-NVSMI_MAX_NODE1=$(awk '{for(i=2;i<=NF;i++) if($i+0>m) m=$i+0} END{print m+0}' \
-    "$OUT_DIR/nvidia_smi_node1.txt" 2>/dev/null || echo 0)
-NVSMI_MAX_NODE0=${NVSMI_MAX_NODE0:-0}
-NVSMI_MAX_NODE1=${NVSMI_MAX_NODE1:-0}
+# 8) max nvidia-smi memory (각 노드의 GPU max)
+declare -a NVSMI_MAX
+for i in 0 1 2; do
+    NVSMI_MAX[$i]=$(awk '{for(i=2;i<=NF;i++) if($i+0>m) m=$i+0} END{print m+0}' \
+        "$OUT_DIR/nvidia_smi_node${i}.txt" 2>/dev/null || echo 0)
+    NVSMI_MAX[$i]=${NVSMI_MAX[$i]:-0}
+done
 
 cat > "$OUT_DIR/meta.json" <<EOF
 {
   "config_path": "$CONFIG_REL",
   "model": "$MODEL",
   "cluster": "$CLUSTER",
-  "gpu_node0": "L4 ×4 (g6.12xlarge)",
-  "gpu_node1": "A10G ×4 (g5.12xlarge)",
+  "gpu_node0": "L40S ×4 (g6e.12xlarge, stage 0)",
+  "gpu_node1": "L40S ×4 (g6e.12xlarge, stage 1)",
+  "gpu_node2": "A100 ×8 (p4d.24xlarge, stages 2 + 3)",
   "descriptor": "$DESCRIPTOR",
-  "config": "production-like (mbs=$MBS ga=$GA seq=$SEQ tp=4 train_steps=$TS partition=$PARTITION)",
+  "config": "production-like (mbs=$MBS ga=$GA seq=$SEQ tp=4 pp=4 train_steps=$TS partition=$PARTITION)",
   "mbs": $MBS,
   "ga": $GA,
   "seq_len": $SEQ,
   "train_steps": $TS,
   "tp": 4,
-  "pp": 2,
+  "pp": 4,
   "gbs_seqs": $((MBS * GA)),
   "gbs_tokens_per_step": $((MBS * GA * SEQ)),
   "pp_layer_partition_str": "$PARTITION",
@@ -234,21 +252,24 @@ cat > "$OUT_DIR/meta.json" <<EOF
   "start_ts_utc": "$START_TS",
   "end_ts_utc": "$END_TS",
   "elapsed_sec": $(awk "BEGIN { print $END_TS - $START_TS }"),
-  "dcgm_start_ts_node0": "$DCGM_START_TS_NODE0",
-  "dcgm_start_ts_node1": "$DCGM_START_TS_NODE1",
+  "dcgm_start_ts_node0": "${DCGM_START_TS[0]}",
+  "dcgm_start_ts_node1": "${DCGM_START_TS[1]}",
+  "dcgm_start_ts_node2": "${DCGM_START_TS[2]}",
   "oom": $OOM,
   "completed_steps": $COMPLETED_STEPS,
   "node0_rc": ${NODE0_RC:-0},
   "node1_rc": ${NODE1_RC:-0},
-  "nvidia_smi_max_used_MiB_node0": $NVSMI_MAX_NODE0,
-  "nvidia_smi_max_used_MiB_node1": $NVSMI_MAX_NODE1
+  "node2_rc": ${NODE2_RC:-0},
+  "nvidia_smi_max_used_MiB_node0": ${NVSMI_MAX[0]},
+  "nvidia_smi_max_used_MiB_node1": ${NVSMI_MAX[1]},
+  "nvidia_smi_max_used_MiB_node2": ${NVSMI_MAX[2]}
 }
 EOF
 
 # 9) Restore baseline partition (sweep 친화)
 if [ -n "$PARTITION_OVERRIDE" ] && [ -n "$ORIGINAL_PARTITION_LINE" ]; then
     sed -i "s|^  pp_layer_partition: .*|$ORIGINAL_PARTITION_LINE|" "$CONFIG"
-    for ip in "$NODE0_IP" "$NODE1_IP"; do
+    for ip in "${ALL_IPS[@]}"; do
         rsync -aq "$CONFIG" "ubuntu@$ip:$CONFIG" 2>/dev/null || true
     done
 fi

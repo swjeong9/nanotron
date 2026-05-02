@@ -59,3 +59,22 @@ for ip in "$NODE0_IP" "$NODE1_IP"; do
 done
 
 echo "[sync] ✓ both nodes in sync (${#CRITICAL_FILES[@]} core files)"
+
+# Data / model / tokenizer presence check on /opt/dlami/nvme (ephemeral SSD —
+# wiped when instance stops). 빠짐 시 NODE 0 즉시 crash + NODE 1 NCCL hang 발생.
+DATA_CHECKS=(
+    "/opt/dlami/nvme/alpaca_sft_local/train.parquet"
+    "/opt/dlami/nvme/llama32_3b_nanotron/model/model/decoder/0"
+    "/opt/dlami/nvme/llama32_3b_nanotron/model/model/decoder/27"
+    "/opt/dlami/nvme/llama32_3b_nanotron/tokenizer/tokenizer.json"
+)
+for ip in "$NODE0_IP" "$NODE1_IP"; do
+    for path in "${DATA_CHECKS[@]}"; do
+        if ! ssh -o BatchMode=yes "ubuntu@$ip" "test -e $path" 2>/dev/null; then
+            echo "[sync] ✗ missing on $ip: $path" >&2
+            echo "[sync]   re-run prepare_alpaca.py + 'aws s3 sync s3://swj-nanotron-model/llama-3.2-3b/nanotron/ /opt/dlami/nvme/llama32_3b_nanotron/' on the worker" >&2
+            exit 3
+        fi
+    done
+done
+echo "[sync] ✓ data + checkpoint + tokenizer present on both nodes"

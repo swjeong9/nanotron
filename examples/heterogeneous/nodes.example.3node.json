@@ -1,0 +1,23 @@
+{
+  "_comment": "Sample 3-node nodes.json for cluster g6e_12xl_x2__p4d_24xl_pp4_tp4. Copy to nodes.json and fill in private_ip when worker instances are up. node_rank field is required because two g6e nodes share the same instance_type — sync.sh / benchmark_single.sh in this cluster identify nodes by node_rank, not instance_type.",
+  "nodes": [
+    {
+      "node_rank": 0,
+      "private_ip": "172.31.x.x",
+      "instance_type": "g6e.12xlarge",
+      "role": "stage 0 — TP=4 intra-node (4× L40S 48GB)"
+    },
+    {
+      "node_rank": 1,
+      "private_ip": "172.31.x.x",
+      "instance_type": "g6e.12xlarge",
+      "role": "stage 1 — TP=4 intra-node (4× L40S 48GB)"
+    },
+    {
+      "node_rank": 2,
+      "private_ip": "172.31.x.x",
+      "instance_type": "p4d.24xlarge",
+      "role": "stages 2 + 3 — two TP=4 groups intra-node (8× A100 40GB, NVSwitch)"
+    }
+  ]
+}

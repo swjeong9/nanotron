@@ -22,7 +22,7 @@ from flash_attn.flash_attn_interface import (
     flash_attn_varlen_func,
 )
 from torch import nn
-from torch.utils.checkpoint import CheckpointFunction
+from torch.utils.checkpoint import checkpoint
 
 from nanotron import distributed as dist
 from nanotron import logging
@@ -763,7 +763,9 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         sequence_mask: torch.Tensor,
     ) -> List[torch.Tensor]:
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states, sequence_mask)
+        # use_reentrant=False — reentrant API (CheckpointFunction.apply) 의 multi-output
+        # activation leak (stair-step memory growth) 회피. PyTorch 권장 modern API.
+        return checkpoint(self._core_forward, hidden_states, sequence_mask, use_reentrant=False)
 
     def forward(
         self,

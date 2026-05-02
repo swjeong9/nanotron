@@ -1,0 +1,17 @@
+{
+  "_comment": "Sample 2-node nodes.json for cluster g6e_48xl__p4d_24xl. Copy to nodes.json and fill in private_ip when worker instances are up. node_rank field required.",
+  "nodes": [
+    {
+      "node_rank": 0,
+      "private_ip": "172.31.x.x",
+      "instance_type": "g6e.48xlarge",
+      "role": "stages 0+1 — two TP=4 groups intra-node (8× L40S 48GB, PCIe Gen4)"
+    },
+    {
+      "node_rank": 1,
+      "private_ip": "172.31.x.x",
+      "instance_type": "p4d.24xlarge",
+      "role": "stages 2+3 — two TP=4 groups intra-node (8× A100 40GB, NVSwitch)"
+    }
+  ]
+}

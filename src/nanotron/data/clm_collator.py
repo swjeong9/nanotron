@@ -156,9 +156,12 @@ class DataCollatorForCLMWithPositionIds:
         current_pp_rank = dist.get_rank(self.parallel_context.pp_pg)
         if current_pp_rank not in [self.input_pp_rank, self.output_pp_rank]:
             assert all(len(example) == 0 for example in examples)
+            # 모델 forward 시그니처와 일치시키기: ``position_ids`` (not ``positions``).
+            # 아래 분기 (line 234) 도 마지막에 ``result.pop("positions") → "position_ids"``
+            # 으로 rename 하므로 이 placeholder 도 동일 key 사용.
             return {
                 "input_ids": TensorPointer(group_rank=self.input_pp_rank),
-                "positions": TensorPointer(group_rank=self.input_pp_rank),
+                "position_ids": TensorPointer(group_rank=self.input_pp_rank),
                 "label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "label_mask": TensorPointer(group_rank=self.output_pp_rank),
             }

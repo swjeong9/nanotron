@@ -1,13 +1,11 @@
 checkpoints:
-  # Benchmark 용도라 학습된 weight 가 필요 없음. interval 을 train_steps 보다
-  # 크게 두고 save_final_state 도 false 로 두어 종료 직전 final save 까지
-  # 모두 skip.
+  # Benchmark 용도. 학습된 weight 저장 안 함.
   checkpoint_interval: 999999
-  checkpoints_path: /opt/dlami/nvme/alpaca_3b_pp2_tp4_ckpts
+  checkpoints_path: /opt/dlami/nvme/alpaca_qwen3_14b_pp4_tp4_ckpts
   checkpoints_path_is_shared_file_system: false
-  # Llama 3.2 3B 의 nanotron 변환 checkpoint. S3 또는 변환 스크립트로 미리 준비:
-  #   aws s3 sync s3://swj-nanotron-model/llama-3.2-3b/nanotron/ /opt/dlami/nvme/llama32_3b_nanotron/
-  resume_checkpoint_path: /opt/dlami/nvme/llama32_3b_nanotron/model
+  # nanotron 으로 변환된 Qwen3-14B (convert_and_upload.sh ARCH=qwen3 결과).
+  # parse_ckpt_path 가 ``<path>/model_config.json`` 을 trigger 로 보므로 outer 경로.
+  resume_checkpoint_path: /opt/dlami/nvme/qwen-3-14b_nanotron
   save_initial_state: false
   save_final_state: false
   load_lr_scheduler: false
@@ -31,7 +29,7 @@ general:
   consumed_train_samples: null
   ignore_sanity_checks: true
   project: heterogeneous
-  run: llama32_3b_alpaca_pp2_tp4_l4_4__a10g_4
+  run: qwen3_14b_alpaca_pp2_tp8_g6e_48xl__p4d
   seed: 42
   step: null
 lighteval: null
@@ -45,39 +43,36 @@ model:
   init_method:
     std: 0.02
   make_vocab_size_divisible_by: 1
-  # Llama 3.2 3B (3.21B params) — HF meta-llama/Llama-3.2-3B/config.json 와 일치.
+  # Qwen 3 14B — HF Qwen/Qwen3-14B/config.json 와 정합.
+  #   head_dim=128 (= hidden_size 5120 / num_heads 40, 대칭이지만 명시 권장).
+  #   _use_qk_norm=true (Qwen 3 공통).
+  #   tie_word_embeddings=false (14B/32B 만 untied).
   model_config:
-    bos_token_id: 128000
-    eos_token_id: 128001
+    bos_token_id: 151643
+    eos_token_id: 151645
     hidden_act: silu
-    hidden_size: 3072
+    hidden_size: 5120
     initializer_range: 0.02
-    intermediate_size: 8192
+    intermediate_size: 17408
     is_qwen2_config: true
-    max_position_embeddings: 131072
-    num_attention_heads: 24
-    num_hidden_layers: 28
+    max_position_embeddings: 40960
+    num_attention_heads: 40
+    num_hidden_layers: 40
     num_key_value_heads: 8
+    head_dim: 128
     pad_token_id: null
     pretraining_tp: 1
-    rms_norm_eps: 1.0e-05
-    rope_scaling:
-      factor: 32.0
-      high_freq_factor: 4.0
-      low_freq_factor: 1.0
-      original_max_position_embeddings: 8192
-      rope_type: llama3
-    rope_theta: 500000.0
+    rms_norm_eps: 1.0e-06
+    rope_scaling: null
+    rope_theta: 1000000.0
     rope_interleaved: false
-    tie_word_embeddings: true
+    tie_word_embeddings: false
     use_cache: true
-    vocab_size: 128256
+    vocab_size: 151936
     _attn_implementation: flash_attention_2
     attention_bias: false
+    _use_qk_norm: true
     _use_doc_masking: true
-    # nanotron Qwen2Config 의 default 가 True 인데, log 가 _tbi_logs 에 무한 누적되어
-    # 매 microbatch × layer 마다 ~12 MB / GPU stair-step memory growth 야기 (2026-04 검증).
-    # full recompute 도 이거 못 막음 (logger reference 가 layer activation 외부). False 로 명시.
     log_attn_probs: false
 optimizer:
   accumulate_grad_in_fp32: true
@@ -103,24 +98,22 @@ parallelism:
   expert_parallel_size: 1
   pp: 2
   pp_engine: 1f1b
-  # 28 layer 균등 분할 — 한 stage 당 14 layer. 비대칭 sweep 시 sed 으로 override.
-  pp_layer_partition: [14, 14]
+  # 40 layer 의 균등 4-way partition. 비대칭 sweep 시 sed 으로 override.
+  pp_layer_partition: [16, 24]
   recompute_layer: true
-  tp: 4                                # intra-node TP=4 (4 GPU/node)
+  tp: 8
   tp_linear_async_communication: false
   tp_mode: ALL_REDUCE
 profiler: null
 tokenizer:
   tokenizer_max_length: null
-  # 로컬 경로 사용 — HF gated repo 401 회피. 양 worker 노드에 tokenizer 파일이
-  # /opt/dlami/nvme/llama32_3b_nanotron/tokenizer/ 에 미리 sync 되어 있어야 함.
-  tokenizer_name_or_path: /opt/dlami/nvme/llama32_3b_nanotron/tokenizer
+  tokenizer_name_or_path: /opt/dlami/nvme/qwen-3-14b_nanotron
   tokenizer_revision: null
 tokens:
-  batch_accumulation_per_replica: 64
+  batch_accumulation_per_replica: 16
   limit_test_batches: 0
   limit_val_batches: 0
   micro_batch_size: 2
-  sequence_length: 1024
-  train_steps: 3
+  sequence_length: 8192
+  train_steps: 2
   val_check_interval: -1

@@ -71,8 +71,20 @@ class ParallelContext:
             )
         )
         self.world_ranks_to_pg = {}
-        self.local_pg = self.create_new_group(ranks.reshape((-1, self.local_world_size)))
-        assert int(os.environ.get("LOCAL_RANK")) == dist.get_rank(self.local_pg), "Local rank mismatch"
+        # ---------------------------------------------------------------
+        # [변경] local_pg 비활성화 — 노드 별 nproc_per_node 가 다르면 NCCL deadlock.
+        # ---------------------------------------------------------------
+        # 기존 구현: ``ranks.reshape((-1, self.local_world_size))`` 로 local group 들 생성.
+        # 모든 node 가 같은 ``LOCAL_WORLD_SIZE`` 일 때만 정합. 우리 환경 (g6e #1: 4 + g6e #2: 4 +
+        # p4d: 8) 에선:
+        #   - node 0/1 (LOCAL_WORLD_SIZE=4): all_groups = [(0,1,2,3),(4,5,6,7),(8,9,10,11),(12,13,14,15)]
+        #   - node 2   (LOCAL_WORLD_SIZE=8): all_groups = [(0,1,2,3,4,5,6,7),(8,9,10,11,12,13,14,15)]
+        # 이 두 호출이 collective ``dist.new_group`` 의 첫 iteration 에서 서로 다른 group 정의를
+        # 시도 → NCCL group creation deadlock (모든 rank 가 다른 의견을 내며 영구 wait).
+        # local_pg 는 사실 이 파일 안에서만 사용되며 (line 75 의 assert 한 줄), 외부 사용처 없음.
+        # 비대칭 LOCAL_WORLD_SIZE 환경 호환을 위해 제거.
+        # self.local_pg = self.create_new_group(ranks.reshape((-1, self.local_world_size)))
+        # assert int(os.environ.get("LOCAL_RANK")) == dist.get_rank(self.local_pg), "Local rank mismatch"
 
         # Relevant process groups containing the current rank
         self.tp_pg = self.create_new_group(ranks.transpose((0, 1, 2, 3, 4)).reshape((-1, self.tensor_parallel_size)))

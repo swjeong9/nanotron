@@ -314,19 +314,20 @@ def get_train_dataloader(
     ]:
         train_dataset = train_dataset.with_format(type="numpy", columns=["input_ids"], output_all_columns=True)
 
-    # Case of ranks not requiring data. We give them an infinite dummy dataloader
+    # Case of ranks not requiring data. We give them an infinite dummy dataloader.
+    # ---------------------------------------------------------------
+    # [변경] SFT (multi-column) 호환 — column 검사 hack 제거.
+    # ---------------------------------------------------------------
+    # 기존 구현: dataset 에 input_ids 컬럼만 있다고 가정하고 ``remove_columns("input_ids")``
+    # 후 비어있는지 assert. SFT 경로 (sft_processing.prepare_sft_dataset) 가 만든
+    # multi-column dataset (input_ids, label_ids, label_mask, positions, attention_mask) 에선:
+    #   1) 첫 assert (`column_names == ["input_ids"]`) 가 깨지고
+    #   2) 살아남아도 두 번째 assert (column 1개 제거해도 안 비어있음) 가 깨짐.
+    # PP=2 까진 input/output 외 중간 rank 가 없어 이 분기 자체를 안 타지만 PP≥4 부터
+    # 중간 stage 가 생겨 표면화. 중간 rank 는 EmptyInfiniteDataset 으로 길이만 알면
+    # 되므로 column hack 불필요 — len(train_dataset) 만 잡고 EmptyInfiniteDataset 생성.
     else:
-        #
-        assert train_dataset.column_names == ["input_ids"], (
-            f"Dataset has to have a single column, with `input_ids` as the column name. "
-            f"Current dataset: {train_dataset}"
-        )
         dataset_length = len(train_dataset)
-        train_dataset = train_dataset.remove_columns(column_names="input_ids")
-        assert (
-            len(train_dataset) == 0
-        ), f"Dataset has to be empty after removing the `input_ids` column. Current dataset: {train_dataset}"
-        # HACK as if we remove the last column of a train_dataset, it becomes empty and it's number of rows becomes empty.
         train_dataset = EmptyInfiniteDataset(length=dataset_length)
         # No need to spawn a lot of workers, we can just use main
         dataloader_num_workers = 0

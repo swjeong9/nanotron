@@ -27,6 +27,7 @@ monotonic toward L4-heavy) 가 더 큰 모델 + TP=4 환경에서도 동일한�
 | GBS (sequences) | 128 |
 | tokens per step | 131 K |
 | recompute_layer | false |
+| train_steps per partition | 5 (1 warmup + 4 data) |
 | TP | 4 |
 | PP | 2 |
 | DP | 1 |
@@ -76,7 +77,12 @@ bash examples/heterogeneous/clusters/g6_12xl__g5_12xl_pp2_tp4/sweep_partitions.s
 각 iteration 의 raw data → `/opt/dlami/nvme/runs/g6_12xl__g5_12xl_pp2_tp4/llama32_3b/<descriptor>/`,
 plot 결과 → `examples/heterogeneous/data/...` + `figures/...`.
 
-Per iteration 시간 ~13 분. fit 27 점 다 돌리면 ~6 시간. fit-only 15 점 ~3.5 시간.
+Per iteration 시간 ~6.5 분 (5 step, 1 warmup + 4 data). fit 27 점 다 돌리면 ~3 시간.
+fit-only 15 점 ~1.7 시간. fit range 4..24 (21 점) ~2.3 시간.
+
+원래 10 step 에서 5 step 으로 단축: 데이터 포인트 9 → 4 으로 stderr √(9/4)≈1.5× 증가하지만
+baseline [14, 14] step variance < 5% 라 분석 영향 미미. plot 코드의 `STEADY_SLICE = slice(1, None)`
+이 그대로 동작.
 
 ## 분석 포인트 (1B sweep 와 비교)
 

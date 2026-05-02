@@ -174,3 +174,20 @@ tb_logs/
 # Heterogeneous-PP 연구의 benchmark figures (DCGM 시계열 + ga sweep summary
 # plots). 본 repo 는 코드/config 만 추적하고 그림은 매번 재생성.
 examples/heterogeneous/figures/
+
+# Heterogeneous-PP 의 raw 데이터 — S3 (swj-nanotron-data) 에 sync.
+# 한 sweep 당 ~100MB+ 라 git 에 안 들이고, examples/heterogeneous/data/raw/README.md
+# 의 instruction 으로 download. README 만 git 에 추적 (parent dir 통째 ignore 시
+# negation 안 먹히므로 ``**/*`` 패턴으로 children 만 ignore).
+examples/heterogeneous/data/raw/**/*
+!examples/heterogeneous/data/raw/README.md
+
+# Heterogeneous-PP 의 stats / meta — 모든 partition 결과가 cluster 마다 누적. raw 와
+# 마찬가지로 S3 (swj-nanotron-data) 에 sync. README 만 git 추적.
+examples/heterogeneous/data/**/*
+!examples/heterogeneous/data/raw
+!examples/heterogeneous/data/raw/README.md
+!examples/heterogeneous/data/README.md
+
+# Local-only — 인스턴스 launch 시마다 변경되는 IP 등록 파일.
+examples/heterogeneous/nodes.json
